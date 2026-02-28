@@ -290,6 +290,7 @@ fn is_main_layout_mouse_interactive(active_block: ActiveBlock) -> bool {
   !matches!(
     active_block,
     ActiveBlock::HelpMenu
+      | ActiveBlock::Queue
       | ActiveBlock::Error
       | ActiveBlock::SelectDevice
       | ActiveBlock::Analysis
@@ -300,6 +301,7 @@ fn is_main_layout_mouse_interactive(active_block: ActiveBlock) -> bool {
       | ActiveBlock::Settings
       | ActiveBlock::Dialog(_)
       | ActiveBlock::SortMenu
+      | ActiveBlock::Party
   )
 }
 

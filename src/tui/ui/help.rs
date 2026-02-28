@@ -298,9 +298,19 @@ pub fn get_help_docs(key_bindings: &KeyBindings) -> Vec<Vec<String>> {
       String::from("Hovered over track"),
     ],
     vec![
+      String::from("Show queue"),
+      key_bindings.show_queue.to_string(),
+      String::from("General"),
+    ],
+    vec![
       String::from("Open sort menu"),
       String::from(","),
       String::from("Track/Album/Artist list"),
+    ],
+    vec![
+      String::from("Open Listening Party menu"),
+      key_bindings.listening_party.to_string(),
+      String::from("General"),
     ],
   ]
 }

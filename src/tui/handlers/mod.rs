@@ -16,9 +16,11 @@ mod home;
 mod input;
 mod library;
 mod mouse;
+mod party;
 mod playbar;
 mod playlist;
 mod podcasts;
+mod queue_menu;
 mod recently_played;
 mod search_results;
 mod select_device;
@@ -41,6 +43,12 @@ pub fn handle_app(key: Key, app: &mut App) {
     && app.settings_unsaved_prompt_visible
   {
     settings::handler(key, app);
+    return;
+  }
+
+  // When Party popup is open, all keys go to the party handler first (so 'c' and 'l' aren't stolen by global bindings).
+  if app.get_current_route().active_block == ActiveBlock::Party {
+    handle_block_events(key, app);
     return;
   }
 
@@ -90,6 +98,10 @@ pub fn handle_app(key: Key, app: &mut App) {
     _ if key == app.user_config.keys.help => {
       app.push_navigation_stack(RouteId::HelpMenu, ActiveBlock::HelpMenu);
     }
+    _ if key == app.user_config.keys.show_queue => {
+      app.dispatch(IoEvent::GetQueue);
+      app.push_navigation_stack(RouteId::Queue, ActiveBlock::Queue);
+    }
 
     _ if key == app.user_config.keys.shuffle => {
       app.shuffle();
@@ -115,6 +127,9 @@ pub fn handle_app(key: Key, app: &mut App) {
     _ if key == app.user_config.keys.open_settings => {
       app.load_settings_for_category();
       app.push_navigation_stack(RouteId::Settings, ActiveBlock::Settings);
+    }
+    _ if key == app.user_config.keys.listening_party => {
+      app.push_navigation_stack(RouteId::Party, ActiveBlock::Party);
     }
     Key::Char('W') => match app.get_current_route().active_block {
       ActiveBlock::Input
@@ -213,6 +228,12 @@ fn handle_block_events(key: Key, app: &mut App) {
     ActiveBlock::SortMenu => {
       sort_menu::handler(key, app);
     }
+    ActiveBlock::Queue => {
+      queue_menu::handler(key, app);
+    }
+    ActiveBlock::Party => {
+      party::handler(key, app);
+    }
   }
 }
 
@@ -236,6 +257,12 @@ fn handle_escape(app: &mut App) {
       app.clear_playlist_track_dialog_state();
     }
     ActiveBlock::HelpMenu => {
+      app.pop_navigation_stack();
+    }
+    ActiveBlock::Queue => {
+      app.pop_navigation_stack();
+    }
+    ActiveBlock::Party => {
       app.pop_navigation_stack();
     }
     // These are global views that have no active/inactive distinction so do nothing

@@ -140,6 +140,8 @@ pub fn handle_right_event(app: &mut App) {
       RouteId::ExitPrompt => {}
       RouteId::Settings => {}
       RouteId::HelpMenu => {}
+      RouteId::Queue => {}
+      RouteId::Party => {}
     },
     _ => {}
   };

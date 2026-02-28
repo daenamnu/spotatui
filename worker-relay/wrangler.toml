@@ -1,0 +1,11 @@
+name = "spotatui-party"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[[durable_objects.bindings]]
+name = "PARTY_ROOM"
+class_name = "PartyRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PartyRoom"]

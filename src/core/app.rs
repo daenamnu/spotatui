@@ -1,6 +1,7 @@
 use crate::cli::UpdateInfo;
 use crate::core::sort::{SortContext, SortState};
 use crate::core::user_config::UserConfig;
+use crate::infra::network::sync::{PartySession, PartyStatus};
 use crate::infra::network::IoEvent;
 use anyhow::anyhow;
 use ratatui::layout::Size;
@@ -9,7 +10,7 @@ use rspotify::{
   model::{
     album::{FullAlbum, SavedAlbum, SimplifiedAlbum},
     artist::FullArtist,
-    context::CurrentPlaybackContext,
+    context::{CurrentPlaybackContext, CurrentUserQueue},
     device::DevicePayload,
     idtypes::{ArtistId, PlaylistId, ShowId, TrackId},
     page::{CursorBasedPage, Page},
@@ -154,6 +155,8 @@ pub enum ActiveBlock {
   ExitPrompt,
   Settings,
   SortMenu,
+  Queue,
+  Party,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -180,6 +183,8 @@ pub enum RouteId {
   ExitPrompt,
   Settings,
   HelpMenu,
+  Queue,
+  Party,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -512,6 +517,8 @@ pub struct App {
   pub current_playback_context: Option<CurrentPlaybackContext>,
   pub last_track_id: Option<String>,
   pub devices: Option<DevicePayload>,
+  pub queue: Option<CurrentUserQueue>,
+  pub queue_selected_index: usize,
   #[cfg(feature = "cover-art")]
   pub cover_art: crate::tui::cover_art::CoverArt,
   // Inputs:
@@ -641,6 +648,14 @@ pub struct App {
   pub status_message: Option<String>,
   /// When to clear the status message
   pub status_message_expires_at: Option<Instant>,
+  /// Listening party status
+  pub party_status: PartyStatus,
+  /// Active listening party session data
+  pub party_session: Option<PartySession>,
+  /// Input buffer for the party join code
+  pub party_input: Vec<char>,
+  /// Cursor position in party code input
+  pub party_input_idx: usize,
   /// Pending track table selection to apply when new page loads
   pub pending_track_table_selection: Option<PendingTrackSelection>,
   /// Maps visible track table rows to source playlist item positions.
@@ -719,6 +734,8 @@ impl Default for App {
       current_playback_context: None,
       last_track_id: None,
       devices: None,
+      queue: None,
+      queue_selected_index: 0,
       input: vec![],
       input_idx: 0,
       input_cursor_position: 0,
@@ -805,6 +822,10 @@ impl Default for App {
       animation_tick: 0,
       status_message: None,
       status_message_expires_at: None,
+      party_status: PartyStatus::default(),
+      party_session: None,
+      party_input: Vec::new(),
+      party_input_idx: 0,
       pending_track_table_selection: None,
       playlist_track_positions: None,
       playlist_picker_selected_index: 0,
@@ -1128,6 +1149,11 @@ impl App {
         self.song_progress_ms = (self.song_progress_ms + tick_rate_ms).min(duration_ms);
       }
       // When paused, keep song_progress_ms unchanged
+    }
+
+    // Periodic party sync: host broadcasts state every ~2 seconds (~125 ticks at 16ms)
+    if self.party_status == PartyStatus::Hosting && self.animation_tick % 125 == 0 {
+      self.dispatch(IoEvent::SyncPlayback);
     }
   }
 
@@ -2488,6 +2514,12 @@ impl App {
           value: SettingValue::Key(key_to_string(&self.user_config.keys.add_item_to_queue)),
         },
         SettingItem {
+          id: "keys.show_queue".to_string(),
+          name: "Show Queue".to_string(),
+          description: "Show playback queue".to_string(),
+          value: SettingValue::Key(key_to_string(&self.user_config.keys.show_queue)),
+        },
+        SettingItem {
           id: "keys.copy_song_url".to_string(),
           name: "Copy Song URL".to_string(),
           description: "Copy current song URL to clipboard".to_string(),
@@ -2856,6 +2888,13 @@ impl App {
           if let SettingValue::Key(v) = &setting.value {
             if let Ok(key) = crate::core::user_config::parse_key_public(v.clone()) {
               self.user_config.keys.add_item_to_queue = key;
+            }
+          }
+        }
+        "keys.show_queue" => {
+          if let SettingValue::Key(v) = &setting.value {
+            if let Ok(key) = crate::core::user_config::parse_key_public(v.clone()) {
+              self.user_config.keys.show_queue = key;
             }
           }
         }

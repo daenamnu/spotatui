@@ -217,6 +217,18 @@ pub fn draw_playbar(f: &mut Frame<'_>, app: &App, layout_chunk: Rect) {
         current_playback_context.device.volume_percent.unwrap_or(0)
       );
 
+      if let Some(session) = &app.party_session {
+        let party_label = match session.role {
+          crate::infra::network::sync::PartyRole::Host => {
+            format!("Party: {} listeners", session.guests.len())
+          }
+          crate::infra::network::sync::PartyRole::Guest => {
+            format!("Party: following {}", session.host_name)
+          }
+        };
+        title = format!("{} | {}", title, party_label);
+      }
+
       if let Some(message) = app.status_message.as_ref() {
         title = format!("{} | {}", title, message);
       }

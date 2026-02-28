@@ -548,8 +548,10 @@ pub struct KeyBindingsString {
   audio_analysis: Option<String>,
   basic_view: Option<String>,
   add_item_to_queue: Option<String>,
+  show_queue: Option<String>,
   open_settings: Option<String>,
   save_settings: Option<String>,
+  listening_party: Option<String>,
 }
 
 #[derive(Clone)]
@@ -580,8 +582,10 @@ pub struct KeyBindings {
   pub audio_analysis: Key,
   pub basic_view: Key,
   pub add_item_to_queue: Key,
+  pub show_queue: Key,
   pub open_settings: Key,
   pub save_settings: Key,
+  pub listening_party: Key,
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -609,6 +613,7 @@ pub struct BehaviorConfigString {
   pub set_window_title: Option<bool>,
   pub visualizer_style: Option<VisualizerStyle>,
   pub dismissed_announcements: Option<Vec<String>>,
+  pub relay_server_url: Option<String>,
   #[cfg(feature = "cover-art")]
   pub draw_cover_art: Option<bool>,
   #[cfg(feature = "cover-art")]
@@ -640,6 +645,7 @@ pub struct BehaviorConfig {
   pub set_window_title: bool,
   pub visualizer_style: VisualizerStyle,
   pub dismissed_announcements: Vec<String>,
+  pub relay_server_url: String,
   #[cfg(feature = "cover-art")]
   pub draw_cover_art: bool,
   #[cfg(feature = "cover-art")]
@@ -698,6 +704,7 @@ impl UserConfig {
         audio_analysis: Key::Char('v'),
         basic_view: Key::Char('B'),
         add_item_to_queue: Key::Char('z'),
+        show_queue: Key::Char('Q'),
         // On macOS, use Ctrl+, for settings since Alt+, produces ≤ on most keyboard layouts
         // On other platforms, keep Alt+, for consistency with many apps
         open_settings: if is_macos {
@@ -706,6 +713,7 @@ impl UserConfig {
           Key::Alt(',')
         },
         save_settings: Key::Alt('s'),
+        listening_party: Key::Ctrl('p'),
       },
       behavior: BehaviorConfig {
         seek_milliseconds: 5 * 1000,
@@ -731,6 +739,7 @@ impl UserConfig {
         set_window_title: true,
         visualizer_style: VisualizerStyle::default(),
         dismissed_announcements: Vec::new(),
+        relay_server_url: "wss://spotatui-party.spotatui.workers.dev/ws".to_string(),
         #[cfg(feature = "cover-art")]
         draw_cover_art: true,
         #[cfg(feature = "cover-art")]
@@ -802,8 +811,10 @@ impl UserConfig {
     to_keys!(audio_analysis);
     to_keys!(basic_view);
     to_keys!(add_item_to_queue);
+    to_keys!(show_queue);
     to_keys!(open_settings);
     to_keys!(save_settings);
+    to_keys!(listening_party);
 
     Ok(())
   }
@@ -952,6 +963,13 @@ impl UserConfig {
         .collect();
     }
 
+    if let Some(relay_server_url) = behavior_config.relay_server_url {
+      let trimmed = relay_server_url.trim();
+      if !trimmed.is_empty() {
+        self.behavior.relay_server_url = trimmed.to_string();
+      }
+    }
+
     #[cfg(feature = "cover-art")]
     if let Some(draw_cover_art) = behavior_config.draw_cover_art {
       self.behavior.draw_cover_art = draw_cover_art;
@@ -1031,6 +1049,7 @@ impl UserConfig {
       set_window_title: Some(self.behavior.set_window_title),
       visualizer_style: Some(self.behavior.visualizer_style),
       dismissed_announcements: Some(self.behavior.dismissed_announcements.clone()),
+      relay_server_url: Some(self.behavior.relay_server_url.clone()),
       #[cfg(feature = "cover-art")]
       draw_cover_art: Some(self.behavior.draw_cover_art),
       #[cfg(feature = "cover-art")]
@@ -1103,8 +1122,10 @@ impl UserConfig {
       audio_analysis: Some(key_to_config_string(self.keys.audio_analysis)),
       basic_view: Some(key_to_config_string(self.keys.basic_view)),
       add_item_to_queue: Some(key_to_config_string(self.keys.add_item_to_queue)),
+      show_queue: Some(key_to_config_string(self.keys.show_queue)),
       open_settings: Some(key_to_config_string(self.keys.open_settings)),
       save_settings: Some(key_to_config_string(self.keys.save_settings)),
+      listening_party: Some(key_to_config_string(self.keys.listening_party)),
     };
 
     // Helper to build theme config from current values

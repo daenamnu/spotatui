@@ -1327,8 +1327,17 @@ of the app. Beware that this comes at a CPU cost!",
 }
 
 async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, network: &mut Network) {
-  while let Ok(io_event) = io_rx.recv() {
-    network.handle_network_event(io_event).await;
+  loop {
+    match io_rx.try_recv() {
+      Ok(io_event) => {
+        network.handle_network_event(io_event).await;
+      }
+      Err(std::sync::mpsc::TryRecvError::Empty) => {
+        network.process_party_messages().await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+      }
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+    }
   }
 }
 
@@ -2060,6 +2069,13 @@ async fn start_ui(
         ActiveBlock::HelpMenu => {
           ui::draw_help_menu(f, &app);
         }
+        ActiveBlock::Queue => {
+          ui::draw_queue(f, &app);
+        }
+        ActiveBlock::Party => {
+          ui::draw_main_layout(f, &app);
+          ui::draw_party(f, &app);
+        }
         ActiveBlock::Error => {
           ui::draw_error_screen(f, &app);
         }
@@ -2386,6 +2402,11 @@ async fn start_ui(
         );
         match current_route.active_block {
           ActiveBlock::HelpMenu => ui::draw_help_menu(f, &app),
+          ActiveBlock::Queue => ui::draw_queue(f, &app),
+          ActiveBlock::Party => {
+            ui::draw_main_layout(f, &app);
+            ui::draw_party(f, &app);
+          }
           ActiveBlock::Error => ui::draw_error_screen(f, &app),
           ActiveBlock::SelectDevice => ui::draw_device_list(f, &app),
           ActiveBlock::Analysis => ui::audio_analysis::draw(f, &app),
