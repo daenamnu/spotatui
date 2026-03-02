@@ -1088,6 +1088,12 @@ impl App {
     // Increment global animation tick (wraps after ~9.4 quintillion ticks, effectively never)
     self.animation_tick = self.animation_tick.wrapping_add(1);
 
+    // Periodic party sync: host broadcasts state every ~2 seconds (~125 ticks at 16ms)
+    // Keep this before early-return paths so sync still happens during native-streaming fast paths.
+    if self.party_status == PartyStatus::Hosting && self.animation_tick % 125 == 0 {
+      self.dispatch(IoEvent::SyncPlayback);
+    }
+
     if let Some(expires_at) = self.status_message_expires_at {
       if Instant::now() >= expires_at {
         self.status_message = None;
@@ -1156,11 +1162,6 @@ impl App {
         self.song_progress_ms = (self.song_progress_ms + tick_rate_ms).min(duration_ms);
       }
       // When paused, keep song_progress_ms unchanged
-    }
-
-    // Periodic party sync: host broadcasts state every ~2 seconds (~125 ticks at 16ms)
-    if self.party_status == PartyStatus::Hosting && self.animation_tick % 125 == 0 {
-      self.dispatch(IoEvent::SyncPlayback);
     }
   }
 

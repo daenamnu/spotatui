@@ -773,6 +773,8 @@ impl Network {
       (uri, playing, progress)
     };
 
+    let mut switched_track = false;
+
     // Track change takes priority
     if current_uri != track_uri && !track_uri.is_empty() {
       if let Ok(track_id) = TrackId::from_uri(&track_uri) {
@@ -780,12 +782,14 @@ impl Network {
         self
           .start_playback(None, Some(vec![playable_id.into_static()]), None)
           .await;
+        switched_track = true;
       }
-      return;
     }
 
     // Play/pause sync
-    if current_is_playing != is_playing {
+    // After a track switch, explicitly apply host pause state since starting playback may
+    // begin playing even when host is paused.
+    if (switched_track && !is_playing) || (!switched_track && current_is_playing != is_playing) {
       if is_playing {
         self.start_playback(None, None, None).await;
       } else {
