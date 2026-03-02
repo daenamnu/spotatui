@@ -1333,11 +1333,11 @@ async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, network: &mut Ne
         network.handle_network_event(io_event).await;
       }
       Err(std::sync::mpsc::TryRecvError::Empty) => {
-        network.process_party_messages().await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
       }
       Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
     }
+    network.process_party_messages().await;
   }
 }
 

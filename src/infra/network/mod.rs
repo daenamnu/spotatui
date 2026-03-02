@@ -16,7 +16,7 @@ use rspotify::model::{
   album::SimplifiedAlbum,
   artist::FullArtist,
   enums::{Country, RepeatState},
-  idtypes::{AlbumId, ArtistId, PlayContextId, PlayableId, PlaylistId, ShowId, TrackId, UserId},
+  idtypes::{AlbumId, ArtistId, EpisodeId, PlayContextId, PlayableId, PlaylistId, ShowId, TrackId, UserId},
   show::SimplifiedShow,
   track::FullTrack,
 };
@@ -663,7 +663,9 @@ impl Network {
         sync::SyncMessage::GuestJoined { name } => {
           let mut app = self.app.lock().await;
           if let Some(session) = &mut app.party_session {
-            session.guests.push(name.clone());
+            if !session.guests.contains(&name) {
+              session.guests.push(name.clone());
+            }
           }
           app.status_message = Some(format!("{} joined the party", name));
           app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
@@ -777,10 +779,19 @@ impl Network {
 
     // Track change takes priority
     if current_uri != track_uri && !track_uri.is_empty() {
-      if let Ok(track_id) = TrackId::from_uri(&track_uri) {
-        let playable_id: rspotify::model::idtypes::PlayableId = track_id.into();
+      let playable: Option<PlayableId<'static>> =
+        if let Ok(id) = TrackId::from_uri(&track_uri) {
+          let p: PlayableId<'_> = id.into();
+          Some(p.into_static())
+        } else if let Ok(id) = EpisodeId::from_uri(&track_uri) {
+          let p: PlayableId<'_> = id.into();
+          Some(p.into_static())
+        } else {
+          None
+        };
+      if let Some(playable_id) = playable {
         self
-          .start_playback(None, Some(vec![playable_id.into_static()]), None)
+          .start_playback(None, Some(vec![playable_id]), None)
           .await;
         switched_track = true;
       }
@@ -834,10 +845,19 @@ impl Network {
         self.seek(position_ms as u32).await;
       }
       sync::PlaybackAction::PlayTrack { uri } => {
-        if let Ok(track_id) = TrackId::from_uri(&uri) {
-          let playable_id: rspotify::model::idtypes::PlayableId = track_id.into();
+        let playable: Option<PlayableId<'static>> =
+          if let Ok(id) = TrackId::from_uri(&uri) {
+            let p: PlayableId<'_> = id.into();
+            Some(p.into_static())
+          } else if let Ok(id) = EpisodeId::from_uri(&uri) {
+            let p: PlayableId<'_> = id.into();
+            Some(p.into_static())
+          } else {
+            None
+          };
+        if let Some(playable_id) = playable {
           self
-            .start_playback(None, Some(vec![playable_id.into_static()]), None)
+            .start_playback(None, Some(vec![playable_id]), None)
             .await;
         }
       }

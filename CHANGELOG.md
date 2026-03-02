@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Listening Party Mode (Host/Join)**: Added an in-app listening party flow with a relay-backed session model, including host/join states, party status in the playbar, and a dedicated party popup (`Ctrl+p` by default).
+- **Party Guest Name and Room Code UX**: Added required guest name input and 6-character code entry for joining parties, plus host-side guest list and control-mode display.
+- **Queue View Route**: Added a dedicated queue screen with selectable entries and a configurable keybinding to open it (`Q` by default).
+- **Relay Subproject for Party Sync**: Added `worker-relay/` Cloudflare Worker + Durable Object implementation for room creation, join routing, websocket relaying, and basic rate limiting.
+- **Config and Keybinding Extensions**: Added `behavior.relay_server_url`, `behavior.stop_after_current_track`, `keys.show_queue`, and `keys.listening_party` configuration support.
+
+### Changed
+
+- **Token Refresh State Handling**: Authentication refresh now updates in-memory expiry tracking after successful token refresh to avoid repeated refresh dispatch loops.
+- **Main Loop Network Polling**: Tokio network loop now interleaves IO event handling with periodic party-message processing.
+
+### Fixed
+
+- **Stop-After-Current-Track Behavior**: Native streaming playback now correctly pauses after a natural track transition when `stop_after_current_track` is enabled, instead of auto-continuing.
+
 ## [0.37.0] - 2026-02-27
 
 ### Added

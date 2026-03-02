@@ -181,6 +181,7 @@ export class PartyRoom extends DurableObject {
         const prevName = session.name;
         session.name = name;
         if (!session.isHost && prevName !== session.name) {
+          this.broadcastExcept(ws, { type: "guest_left", name: prevName });
           this.broadcastExcept(ws, { type: "guest_joined", name: session.name });
         }
         if (session.isHost) this.hostName = session.name;
