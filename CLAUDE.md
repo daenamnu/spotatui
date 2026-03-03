@@ -1,4 +1,6 @@
-# Copilot Instructions for spotatui
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Build & Run
 
@@ -58,6 +60,10 @@ Key event → tui/event/ → tui/handlers/handle_app()
 
 Use `app.push_navigation_stack(RouteId::X, ActiveBlock::X)` to navigate and `app.pop_navigation_stack()` to go back.
 
+### Listening Party / sync
+
+The Party feature (`src/infra/network/sync.rs`) connects host and guests via WebSocket relay using `SyncMessage` enums. `IoEvent::StartParty`, `JoinParty`, `SyncPlayback`, and `LeaveParty` drive the party lifecycle from handlers.
+
 ## Key Conventions
 
 ### Adding a new screen / feature
@@ -77,15 +83,11 @@ Use `ScrollableResultPages<T>` (defined in `src/core/app.rs`) for any data that 
 
 ### Status messages
 
-Show feedback to the user with `app.show_status_message(msg, ttl_ms)`. Do not write directly to `app.status_message`.
+Show feedback with `app.show_status_message(msg, ttl_ms)`. Do not write directly to `app.status_message`.
 
 ### Dialog state cleanup
 
 When closing a dialog, always call `app.clear_playlist_track_dialog_state()` alongside `app.dialog = None` and `app.confirm = false`.
-
-### Error handling
-
-Use `anyhow::Result<T>` and the `?` operator throughout. Do not use `unwrap()` in non-test code.
 
 ### User-configurable keybindings
 
@@ -96,3 +98,4 @@ Always check `app.user_config.keys.<action>` instead of hard-coding key literals
 - Default features include `streaming` (librespot) and audio visualization backends.
 - `--no-default-features --features telemetry` is the minimal build used for CI and fast iteration.
 - Platform-specific audio backends (ALSA, PipeWire, PortAudio, Rodio) are gated behind their own features.
+- `cover-art` feature enables album art rendering via `ratatui-image`.

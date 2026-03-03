@@ -3,7 +3,7 @@
 
 .DS_store
 .env
-.spotify_token_cache.json 
+.spotify_token_cache.json
 .cached_device_id.txt
 spotify-tui.sketch
 
@@ -18,6 +18,10 @@ tags
 
 .idea
 .vscode
+.cursor
 
 # Local cargo config (platform-specific settings)
 .cargo/
+
+# build artifacts from the worker-relay subproject
+worker-relay/node_modules/

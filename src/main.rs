@@ -1431,8 +1431,17 @@ of the app. Beware that this comes at a CPU cost!",
 }
 
 async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, network: &mut Network) {
-  while let Ok(io_event) = io_rx.recv() {
-    network.handle_network_event(io_event).await;
+  loop {
+    match io_rx.try_recv() {
+      Ok(io_event) => {
+        network.handle_network_event(io_event).await;
+      }
+      Err(std::sync::mpsc::TryRecvError::Empty) => {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+      }
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+    }
+    network.process_party_messages().await;
   }
 }
 
@@ -1492,6 +1501,14 @@ async fn handle_player_events(
           if app.last_track_id.as_ref() != Some(&track_id_str) {
             app.last_track_id = Some(track_id_str);
             app.dispatch(IoEvent::GetCurrentPlayback);
+          }
+          // If stop-after-track was requested, pause now that Spirc has started the next track
+          if app.pending_stop_after_track {
+            app.pending_stop_after_track = false;
+            if let Some(ref mut ctx) = app.current_playback_context {
+              ctx.is_playing = false;
+            }
+            app.dispatch(IoEvent::PausePlayback);
           }
         }
       }
@@ -1627,13 +1644,19 @@ async fn handle_player_events(
           }
           app.song_progress_ms = 0;
           app.last_track_id = None;
+          if app.user_config.behavior.stop_after_current_track {
+            // Spirc will auto-advance; flag the next Playing event to pause immediately
+            app.pending_stop_after_track = true;
+          }
         }
 
         // Ensure we don't land on the next item paused after the track transition.
         // (librespot Spirc will advance; we may need to resume playback.)
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         if let Ok(mut app) = app.try_lock() {
-          app.dispatch(IoEvent::EnsurePlaybackContinues(track_id.to_string()));
+          if !app.user_config.behavior.stop_after_current_track {
+            app.dispatch(IoEvent::EnsurePlaybackContinues(track_id.to_string()));
+          }
         }
       }
       PlayerEvent::VolumeChanged { volume } => {
@@ -1722,6 +1745,14 @@ async fn handle_player_events(
           if app.last_track_id.as_ref() != Some(&track_id_str) {
             app.last_track_id = Some(track_id_str);
             app.dispatch(IoEvent::GetCurrentPlayback);
+          }
+          // If stop-after-track was requested, pause now that Spirc has started the next track
+          if app.pending_stop_after_track {
+            app.pending_stop_after_track = false;
+            if let Some(ref mut ctx) = app.current_playback_context {
+              ctx.is_playing = false;
+            }
+            app.dispatch(IoEvent::PausePlayback);
           }
         }
       }
@@ -1848,10 +1879,16 @@ async fn handle_player_events(
           }
           app.song_progress_ms = 0;
           app.last_track_id = None;
+          if app.user_config.behavior.stop_after_current_track {
+            // Spirc will auto-advance; flag the next Playing event to pause immediately
+            app.pending_stop_after_track = true;
+          }
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         if let Ok(mut app) = app.try_lock() {
-          app.dispatch(IoEvent::EnsurePlaybackContinues(track_id.to_string()));
+          if !app.user_config.behavior.stop_after_current_track {
+            app.dispatch(IoEvent::EnsurePlaybackContinues(track_id.to_string()));
+          }
         }
       }
       PlayerEvent::VolumeChanged { volume } => {
@@ -2189,6 +2226,13 @@ async fn start_ui(
       terminal.draw(|f| match current_route.active_block {
         ActiveBlock::HelpMenu => {
           ui::draw_help_menu(f, &app);
+        }
+        ActiveBlock::Queue => {
+          ui::draw_queue(f, &app);
+        }
+        ActiveBlock::Party => {
+          ui::draw_main_layout(f, &app);
+          ui::draw_party(f, &app);
         }
         ActiveBlock::Error => {
           ui::draw_error_screen(f, &app);
@@ -2539,6 +2583,11 @@ async fn start_ui(
         );
         match current_route.active_block {
           ActiveBlock::HelpMenu => ui::draw_help_menu(f, &app),
+          ActiveBlock::Queue => ui::draw_queue(f, &app),
+          ActiveBlock::Party => {
+            ui::draw_main_layout(f, &app);
+            ui::draw_party(f, &app);
+          }
           ActiveBlock::Error => ui::draw_error_screen(f, &app),
           ActiveBlock::SelectDevice => ui::draw_device_list(f, &app),
           ActiveBlock::Analysis => ui::audio_analysis::draw(f, &app),

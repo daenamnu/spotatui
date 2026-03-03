@@ -2,8 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Listening Party Mode (Host/Join)**: Added an in-app listening party flow with a relay-backed session model, including host/join states, party status in the playbar, and a dedicated party popup (`Ctrl+p` by default).
+- **Party Guest Name and Room Code UX**: Added required guest name input and 6-character code entry for joining parties, plus host-side guest list and control-mode display.
+- **Queue View Route**: Added a dedicated queue screen with selectable entries and a configurable keybinding to open it (`Q` by default).
+- **Relay Subproject for Party Sync**: Added `worker-relay/` Cloudflare Worker + Durable Object implementation for room creation, join routing, websocket relaying, and basic rate limiting.
+- **Config and Keybinding Extensions**: Added `behavior.relay_server_url`, `behavior.stop_after_current_track`, `keys.show_queue`, and `keys.listening_party` configuration support.
+
+### Changed
+
+- **Token Refresh State Handling**: Authentication refresh now updates in-memory expiry tracking after successful token refresh to avoid repeated refresh dispatch loops.
+- **Main Loop Network Polling**: Tokio network loop now interleaves IO event handling with periodic party-message processing.
+
 ### Fixed
 
+- **Stop-After-Current-Track Behavior**: Native streaming playback now correctly pauses after a natural track transition when `stop_after_current_track` is enabled, instead of auto-continuing.
 - **PortAudio Device-Switch Recovery (macOS/AirPods)**: Added recovery for recoverable PortAudio backend panics when the output device changes (for example, AirPods connect/switch events), reducing playback interruptions and preventing app crashes.
 - **Mac Tahoe 26.2 Build Failure (macOS Media Activation Policy)**: Fixed a macOS Tahoe 26.2 build break by correcting Objective-C FFI types for `NSApplication setActivationPolicy:` (`BOOL` return and `NSInteger` argument).
 - **Settings Shortcut Reliability on macOS Terminals**: Added terminal keyboard-capability detection and runtime fallback handling for `Ctrl+,` when terminal/tmux stacks drop punctuation modifiers; spotatui now applies a session fallback to `Alt+,`, prompts before persisting to `config.yml`, and displays effective shortcuts in Help/Settings UI.

@@ -24,7 +24,7 @@ pub use self::library::draw_user_block;
 pub use self::player::{draw_basic_view, draw_device_list, draw_playbar};
 pub use self::popups::{
   draw_announcement_prompt, draw_dialog, draw_error_screen, draw_exit_prompt, draw_help_menu,
-  draw_sort_menu, draw_update_prompt,
+  draw_party, draw_queue, draw_sort_menu, draw_update_prompt,
 };
 pub use self::search::{draw_input_and_help_box, draw_search_results};
 pub use self::tables::{
@@ -130,5 +130,7 @@ pub fn draw_routes(f: &mut Frame<'_>, app: &App, layout_chunk: Rect) {
     RouteId::ExitPrompt => {} // This is handled as a "full screen" route in main.rs
     RouteId::Settings => {} // This is handled as a "full screen" route in main.rs
     RouteId::HelpMenu => {} // This is handled as a "full screen" route in main.rs
+    RouteId::Queue => {} // This is handled as a "full screen" route in main.rs
+    RouteId::Party => {} // This is handled as a popup overlay in main.rs
   };
 }

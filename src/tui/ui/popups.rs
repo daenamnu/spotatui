@@ -1,4 +1,5 @@
 use crate::core::app::{ActiveBlock, AnnouncementLevel, App, DialogContext};
+use crate::infra::network::sync::PartyStatus;
 use ratatui::{
   layout::{Alignment, Constraint, Direction, Layout, Rect},
   style::{Modifier, Style},
@@ -6,8 +7,10 @@ use ratatui::{
   widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
   Frame,
 };
+use rspotify::model::PlayableItem;
 
 use super::help::get_help_docs;
+use super::util::create_artist_string;
 
 pub fn draw_help_menu(f: &mut Frame<'_>, app: &App) {
   let [area] = f
@@ -48,6 +51,73 @@ pub fn draw_help_menu(f: &mut Frame<'_>, app: &App) {
     )
     .style(help_menu_style);
   f.render_widget(help_menu, area);
+}
+
+fn queue_item_line(item: &PlayableItem) -> String {
+  match item {
+    PlayableItem::Track(track) => {
+      format!("{} - {}", track.name, create_artist_string(&track.artists))
+    }
+    PlayableItem::Episode(episode) => {
+      format!("{} - {}", episode.name, episode.show.name)
+    }
+  }
+}
+
+pub fn draw_queue(f: &mut Frame<'_>, app: &App) {
+  let [area] = f
+    .area()
+    .layout(&Layout::vertical([Constraint::Percentage(100)]).margin(2));
+
+  let style = app.user_config.theme.base_style();
+  let items: Vec<ListItem> = match &app.queue {
+    None => vec![ListItem::new(Span::raw("Loading...")).style(style)],
+    Some(q) => {
+      let mut rows = Vec::new();
+      if let Some(ref now) = q.currently_playing {
+        rows.push(
+          ListItem::new(Line::from(vec![
+            Span::styled("Now playing: ", style.add_modifier(Modifier::BOLD)),
+            Span::raw(queue_item_line(now)),
+          ]))
+          .style(style),
+        );
+      }
+      for item in &q.queue {
+        rows.push(ListItem::new(queue_item_line(item)).style(style));
+      }
+      if rows.is_empty() {
+        rows.push(ListItem::new(Span::raw("No queue (no active device?)")).style(style));
+      }
+      rows
+    }
+  };
+
+  let mut state = ListState::default();
+  let len = items.len();
+  let selected = if len == 0 {
+    None
+  } else {
+    Some(app.queue_selected_index.min(len.saturating_sub(1)))
+  };
+  state.select(selected);
+  let list = List::new(items)
+    .block(
+      Block::default()
+        .borders(Borders::ALL)
+        .style(style)
+        .title(Span::styled("Queue (press Esc to go back)", style))
+        .border_style(style),
+    )
+    .style(style)
+    .highlight_style(
+      Style::default()
+        .fg(app.user_config.theme.active)
+        .bg(app.user_config.theme.inactive)
+        .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol(Line::from("▶ ").style(Style::default().fg(app.user_config.theme.active)));
+  f.render_stateful_widget(list, area, &mut state);
 }
 
 pub fn draw_error_screen(f: &mut Frame<'_>, app: &App) {
@@ -536,4 +606,200 @@ pub fn draw_sort_menu(f: &mut Frame<'_>, app: &App) {
   state.select(Some(app.sort_menu_selected));
 
   f.render_stateful_widget(list, rect, &mut state);
+}
+
+pub fn draw_party(f: &mut Frame<'_>, app: &App) {
+  let [area] = f
+    .area()
+    .layout(&Layout::vertical([Constraint::Percentage(100)]).margin(2));
+
+  let popup_width = 50u16.min(area.width);
+  let popup_height = 16u16.min(area.height);
+  let popup_x = (area.width.saturating_sub(popup_width)) / 2 + area.x;
+  let popup_y = (area.height.saturating_sub(popup_height)) / 2 + area.y;
+  let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+  f.render_widget(Clear, popup_area);
+
+  let style = app.user_config.theme.base_style();
+  let active_style = Style::default()
+    .fg(app.user_config.theme.active)
+    .add_modifier(Modifier::BOLD);
+  let hint_style = Style::default().fg(app.user_config.theme.hint);
+
+  let mut lines: Vec<Line> = Vec::new();
+
+  match &app.party_status {
+    PartyStatus::Disconnected | PartyStatus::Connecting => {
+      if !app.party_input.is_empty() || app.party_input_idx > 0 || !app.party_join_name.is_empty() {
+        let code_str: String = app
+          .party_input
+          .iter()
+          .filter(|c| c.is_alphanumeric())
+          .map(|c| c.to_ascii_uppercase())
+          .collect();
+        let name_str: String = app.party_join_name.iter().collect();
+        let trimmed_name = name_str.trim();
+        lines.push(Line::from(Span::styled(
+          "Enter 6-character party code:",
+          style,
+        )));
+        lines.push(Line::from(""));
+        let display = format!(
+          "  [ {} ]",
+          if code_str.is_empty() {
+            "______".to_string()
+          } else {
+            let mut padded = code_str.clone();
+            while padded.len() < 6 {
+              padded.push('_');
+            }
+            padded
+          }
+        );
+        lines.push(Line::from(Span::styled(display, active_style)));
+        lines.push(Line::from(""));
+
+        let name_display = if name_str.is_empty() {
+          "________________".to_string()
+        } else {
+          name_str.clone()
+        };
+        lines.push(Line::from(Span::styled("Enter your name:", style)));
+        lines.push(Line::from(Span::styled(
+          format!("  [ {} ]", name_display),
+          active_style,
+        )));
+        lines.push(Line::from(""));
+        if code_str.len() == 6 && !trimmed_name.is_empty() {
+          lines.push(Line::from(Span::styled("Press Enter to join", hint_style)));
+        } else if code_str.len() == 6 {
+          lines.push(Line::from(Span::styled(
+            "Type a display name to continue",
+            hint_style,
+          )));
+        } else {
+          let char_count = format!("{}/6 characters", code_str.len());
+          lines.push(Line::from(Span::styled(char_count, hint_style)));
+        }
+        lines.push(Line::from(Span::styled(
+          format!("Name length: {}/32", trimmed_name.chars().count()),
+          hint_style,
+        )));
+        lines.push(Line::from(Span::styled(
+          "Code fills first, then name input",
+          hint_style,
+        )));
+        lines.push(Line::from(Span::styled("Esc to cancel", hint_style)));
+      } else {
+        lines.push(Line::from(Span::styled("Listening Party", active_style)));
+        lines.push(Line::from(""));
+        if app.party_status == PartyStatus::Connecting {
+          lines.push(Line::from(Span::styled("Connecting...", hint_style)));
+        } else {
+          lines.push(Line::from(vec![
+            Span::styled("1 ", active_style),
+            Span::styled("Host a Party", style),
+          ]));
+          lines.push(Line::from(vec![
+            Span::styled("2 ", active_style),
+            Span::styled("Join a Party", style),
+          ]));
+          lines.push(Line::from(""));
+          lines.push(Line::from(Span::styled("Esc to close", hint_style)));
+        }
+      }
+    }
+    PartyStatus::Hosting => {
+      lines.push(Line::from(Span::styled(
+        "Hosting Listening Party",
+        active_style,
+      )));
+      lines.push(Line::from(""));
+      if let Some(session) = &app.party_session {
+        let code_display = if session.code.is_empty() {
+          "Generating...".to_string()
+        } else {
+          session.code.clone()
+        };
+        lines.push(Line::from(vec![
+          Span::styled("Share this code: ", style),
+          Span::styled(code_display, active_style),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+          Span::styled("Control: ", style),
+          Span::styled(session.control_mode.to_string(), style),
+        ]));
+        lines.push(Line::from(""));
+        if session.guests.is_empty() {
+          lines.push(Line::from(Span::styled(
+            "Waiting for guests...",
+            hint_style,
+          )));
+        } else {
+          let listener_label = if session.guests.len() == 1 {
+            "1 listener:".to_string()
+          } else {
+            format!("{} listeners:", session.guests.len())
+          };
+          lines.push(Line::from(Span::styled(listener_label, style)));
+          for (i, guest) in session.guests.iter().enumerate() {
+            let label = format!("  {}. {}", i + 1, guest);
+            lines.push(Line::from(Span::styled(label, style)));
+          }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+          "c - toggle control mode",
+          hint_style,
+        )));
+        lines.push(Line::from(Span::styled("l - leave party", hint_style)));
+        lines.push(Line::from(Span::styled("Esc to close menu", hint_style)));
+      }
+    }
+    PartyStatus::Joined => {
+      lines.push(Line::from(Span::styled(
+        "Listening Party (Guest)",
+        active_style,
+      )));
+      lines.push(Line::from(""));
+      if let Some(session) = &app.party_session {
+        lines.push(Line::from(vec![
+          Span::styled("Host: ", style),
+          Span::styled(&session.host_name, style),
+        ]));
+        lines.push(Line::from(vec![
+          Span::styled("Room: ", style),
+          Span::styled(&session.code, active_style),
+        ]));
+        lines.push(Line::from(vec![
+          Span::styled("Mode: ", style),
+          Span::styled("Following host playback", hint_style),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("l - leave party", hint_style)));
+        lines.push(Line::from(Span::styled("Esc to close menu", hint_style)));
+      }
+    }
+  }
+
+  let title = match &app.party_status {
+    PartyStatus::Hosting => "Party (Hosting)",
+    PartyStatus::Joined => "Party (Joined)",
+    _ => "Party",
+  };
+
+  let paragraph = Paragraph::new(lines)
+    .block(
+      Block::default()
+        .borders(Borders::ALL)
+        .style(style)
+        .title(Span::styled(title, active_style))
+        .border_style(Style::default().fg(app.user_config.theme.active)),
+    )
+    .alignment(Alignment::Center)
+    .wrap(Wrap { trim: false });
+
+  f.render_widget(paragraph, popup_area);
 }

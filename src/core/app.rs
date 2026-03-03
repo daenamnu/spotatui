@@ -1,6 +1,7 @@
 use crate::cli::UpdateInfo;
 use crate::core::sort::{SortContext, SortState};
 use crate::core::user_config::UserConfig;
+use crate::infra::network::sync::{PartySession, PartyStatus};
 use crate::infra::network::IoEvent;
 use crate::tui::event::Key;
 use anyhow::anyhow;
@@ -10,7 +11,7 @@ use rspotify::{
   model::{
     album::{FullAlbum, SavedAlbum, SimplifiedAlbum},
     artist::FullArtist,
-    context::CurrentPlaybackContext,
+    context::{CurrentPlaybackContext, CurrentUserQueue},
     device::DevicePayload,
     idtypes::{ArtistId, PlaylistId, ShowId, TrackId},
     page::{CursorBasedPage, Page},
@@ -193,6 +194,8 @@ pub enum ActiveBlock {
   ExitPrompt,
   Settings,
   SortMenu,
+  Queue,
+  Party,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -219,6 +222,8 @@ pub enum RouteId {
   ExitPrompt,
   Settings,
   HelpMenu,
+  Queue,
+  Party,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -550,7 +555,13 @@ pub struct App {
   pub api_error: String,
   pub current_playback_context: Option<CurrentPlaybackContext>,
   pub last_track_id: Option<String>,
+  /// Set to true when a track ends naturally and stop_after_current_track is enabled.
+  /// The next Playing event will see this flag and immediately pause.
+  #[allow(dead_code)]
+  pub pending_stop_after_track: bool,
   pub devices: Option<DevicePayload>,
+  pub queue: Option<CurrentUserQueue>,
+  pub queue_selected_index: usize,
   #[cfg(feature = "cover-art")]
   pub cover_art: crate::tui::cover_art::CoverArt,
   // Inputs:
@@ -683,6 +694,16 @@ pub struct App {
   pub status_message: Option<String>,
   /// When to clear the status message
   pub status_message_expires_at: Option<Instant>,
+  /// Listening party status
+  pub party_status: PartyStatus,
+  /// Active listening party session data
+  pub party_session: Option<PartySession>,
+  /// Input buffer for the party join code
+  pub party_input: Vec<char>,
+  /// Cursor position in party code input
+  pub party_input_idx: usize,
+  /// Input buffer for the required party guest name
+  pub party_join_name: Vec<char>,
   /// Pending track table selection to apply when new page loads
   pub pending_track_table_selection: Option<PendingTrackSelection>,
   /// Maps visible track table rows to source playlist item positions.
@@ -760,7 +781,10 @@ impl Default for App {
       api_error: String::new(),
       current_playback_context: None,
       last_track_id: None,
+      pending_stop_after_track: false,
       devices: None,
+      queue: None,
+      queue_selected_index: 0,
       input: vec![],
       input_idx: 0,
       input_cursor_position: 0,
@@ -850,6 +874,11 @@ impl Default for App {
       animation_tick: 0,
       status_message: None,
       status_message_expires_at: None,
+      party_status: PartyStatus::default(),
+      party_session: None,
+      party_input: Vec::new(),
+      party_input_idx: 0,
+      party_join_name: Vec::new(),
       pending_track_table_selection: None,
       playlist_track_positions: None,
       playlist_picker_selected_index: 0,
@@ -1201,6 +1230,12 @@ impl App {
   pub fn update_on_tick(&mut self) {
     // Increment global animation tick (wraps after ~9.4 quintillion ticks, effectively never)
     self.animation_tick = self.animation_tick.wrapping_add(1);
+
+    // Periodic party sync: host broadcasts state every ~2 seconds (~125 ticks at 16ms)
+    // Keep this before early-return paths so sync still happens during native-streaming fast paths.
+    if self.party_status == PartyStatus::Hosting && self.animation_tick.is_multiple_of(125) {
+      self.dispatch(IoEvent::SyncPlayback);
+    }
 
     if let Some(expires_at) = self.status_message_expires_at {
       if Instant::now() >= expires_at {
@@ -2443,6 +2478,12 @@ impl App {
           value: SettingValue::Bool(self.user_config.behavior.enable_discord_rpc),
         },
         SettingItem {
+          id: "behavior.stop_after_current_track".to_string(),
+          name: "Stop After Current Track".to_string(),
+          description: "Pause playback when the current track finishes".to_string(),
+          value: SettingValue::Bool(self.user_config.behavior.stop_after_current_track),
+        },
+        SettingItem {
           id: "behavior.enable_announcements".to_string(),
           name: "Remote Announcements".to_string(),
           description: "Show one-time announcements from remote JSON feed".to_string(),
@@ -2628,6 +2669,12 @@ impl App {
           value: SettingValue::Key(key_to_string(&self.user_config.keys.add_item_to_queue)),
         },
         SettingItem {
+          id: "keys.show_queue".to_string(),
+          name: "Show Queue".to_string(),
+          description: "Show playback queue".to_string(),
+          value: SettingValue::Key(key_to_string(&self.user_config.keys.show_queue)),
+        },
+        SettingItem {
           id: "keys.copy_song_url".to_string(),
           name: "Copy Song URL".to_string(),
           description: "Copy current song URL to clipboard".to_string(),
@@ -2802,6 +2849,11 @@ impl App {
         "behavior.enable_discord_rpc" => {
           if let SettingValue::Bool(v) = &setting.value {
             self.user_config.behavior.enable_discord_rpc = *v;
+          }
+        }
+        "behavior.stop_after_current_track" => {
+          if let SettingValue::Bool(v) = &setting.value {
+            self.user_config.behavior.stop_after_current_track = *v;
           }
         }
         "behavior.enable_announcements" => {
@@ -2996,6 +3048,13 @@ impl App {
           if let SettingValue::Key(v) = &setting.value {
             if let Ok(key) = crate::core::user_config::parse_key_public(v.clone()) {
               self.user_config.keys.add_item_to_queue = key;
+            }
+          }
+        }
+        "keys.show_queue" => {
+          if let SettingValue::Key(v) = &setting.value {
+            if let Ok(key) = crate::core::user_config::parse_key_public(v.clone()) {
+              self.user_config.keys.show_queue = key;
             }
           }
         }

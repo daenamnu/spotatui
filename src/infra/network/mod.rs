@@ -4,6 +4,7 @@ pub mod playback;
 pub mod recommend;
 pub mod requests;
 pub mod search;
+pub mod sync;
 pub mod user;
 pub mod utils;
 
@@ -15,10 +16,13 @@ use rspotify::model::{
   album::SimplifiedAlbum,
   artist::FullArtist,
   enums::{Country, RepeatState},
-  idtypes::{AlbumId, ArtistId, PlayContextId, PlayableId, PlaylistId, ShowId, TrackId, UserId},
+  idtypes::{
+    AlbumId, ArtistId, EpisodeId, PlayContextId, PlayableId, PlaylistId, ShowId, TrackId, UserId,
+  },
   show::SimplifiedShow,
   track::FullTrack,
 };
+use rspotify::prelude::Id;
 use rspotify::AuthCodePkceSpotify;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -101,6 +105,7 @@ pub enum IoEvent {
   GetShow(ShowId<'static>),
   GetCurrentShowEpisodes(ShowId<'static>, Option<u32>),
   AddItemToQueue(PlayableId<'static>),
+  GetQueue,
   IncrementGlobalSongCount,
   FetchGlobalSongCount,
   FetchAnnouncements,
@@ -121,6 +126,22 @@ pub enum IoEvent {
   GetTopArtistsMix,
   /// Fetch all playlist tracks and apply sorting
   FetchAllPlaylistTracksAndSort(PlaylistId<'static>),
+  /// Start hosting a listening party
+  StartParty(sync::ControlMode),
+  /// Join an existing listening party by code
+  JoinParty {
+    code: String,
+    name: String,
+  },
+  /// Update the host control mode in the relay
+  SetPartyControlMode(sync::ControlMode),
+  /// Leave the current listening party
+  LeaveParty,
+  /// Broadcast current playback state to party guests (host only)
+  SyncPlayback,
+  /// Send a playback command to the party host (guest only, Phase 2)
+  #[allow(dead_code)]
+  PartyPlaybackCommand(sync::PlaybackAction),
 }
 
 pub struct Network {
@@ -131,6 +152,8 @@ pub struct Network {
   pub app: Arc<Mutex<App>>,
   #[cfg(feature = "streaming")]
   pub streaming_player: Option<Arc<StreamingPlayer>>,
+  pub party_connection: Option<sync::PartyConnection>,
+  pub party_incoming_rx: Option<tokio::sync::mpsc::UnboundedReceiver<sync::SyncMessage>>,
 }
 
 impl Network {
@@ -148,6 +171,8 @@ impl Network {
       client_config,
       app: Arc::clone(app),
       streaming_player,
+      party_connection: None,
+      party_incoming_rx: None,
     }
   }
 
@@ -163,6 +188,8 @@ impl Network {
       small_search_limit: 4,
       client_config,
       app: Arc::clone(app),
+      party_connection: None,
+      party_incoming_rx: None,
     }
   }
 
@@ -340,6 +367,9 @@ impl Network {
       IoEvent::AddItemToQueue(item) => {
         self.add_item_to_queue(item).await;
       }
+      IoEvent::GetQueue => {
+        self.get_queue().await;
+      }
       IoEvent::IncrementGlobalSongCount => {
         self.increment_global_song_count().await;
       }
@@ -383,6 +413,24 @@ impl Network {
       IoEvent::FetchAllPlaylistTracksAndSort(playlist_id) => {
         self.fetch_all_playlist_tracks_and_sort(playlist_id).await;
       }
+      IoEvent::StartParty(control_mode) => {
+        self.start_party(control_mode).await;
+      }
+      IoEvent::JoinParty { code, name } => {
+        self.join_party(code, name).await;
+      }
+      IoEvent::SetPartyControlMode(control_mode) => {
+        self.set_party_control_mode(control_mode).await;
+      }
+      IoEvent::LeaveParty => {
+        self.leave_party().await;
+      }
+      IoEvent::SyncPlayback => {
+        self.sync_playback().await;
+      }
+      IoEvent::PartyPlaybackCommand(action) => {
+        self.party_playback_command(action).await;
+      }
     };
 
     {
@@ -403,12 +451,419 @@ impl Network {
   }
 
   async fn refresh_authentication(&mut self) {
-    // Refresh token if needed
-    // This is implicitly handled by spotify_api_request_json_for which checks 401
-    // But sometimes we might want to force refresh or check validity.
-    // The original code called self.spotify.refresh_token().await.
-    if let Err(e) = self.spotify.refetch_token().await {
+    // refresh_token() calls refetch_token() AND stores the result in self.spotify.token.
+    // Using refetch_token() directly would return the new token without storing it.
+    if let Err(e) = self.spotify.refresh_token().await {
       self.handle_error(anyhow!(e)).await;
+      return;
     }
+
+    // Update app.spotify_token_expiry so the main loop doesn't keep dispatching
+    // RefreshAuthentication on every tick after the original token expires.
+    let new_expiry = {
+      let token_lock = self
+        .spotify
+        .token
+        .lock()
+        .await
+        .expect("Failed to lock token");
+      token_lock.as_ref().map(|t| {
+        let secs = t.expires_in.num_seconds().max(0) as u64;
+        std::time::SystemTime::now()
+          .checked_add(Duration::from_secs(secs))
+          .unwrap_or_else(std::time::SystemTime::now)
+      })
+    };
+
+    if let Some(expiry) = new_expiry {
+      let mut app = self.app.lock().await;
+      app.spotify_token_expiry = expiry;
+    }
+  }
+
+  async fn start_party(&mut self, control_mode: sync::ControlMode) {
+    {
+      let mut app = self.app.lock().await;
+      app.party_status = sync::PartyStatus::Connecting;
+    }
+
+    let relay_url = {
+      let app = self.app.lock().await;
+      app.user_config.behavior.relay_server_url.clone()
+    };
+
+    let mode_str = match &control_mode {
+      sync::ControlMode::HostOnly => "host_only",
+      sync::ControlMode::SharedControl => "shared_control",
+    };
+
+    match sync::connect_to_relay(&relay_url, "create", &[("control_mode", mode_str)]).await {
+      Ok((conn, read)) => {
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(sync::start_party_reader(read, incoming_tx));
+        self.party_connection = Some(conn);
+        self.party_incoming_rx = Some(incoming_rx);
+
+        let mut app = self.app.lock().await;
+        app.party_status = sync::PartyStatus::Hosting;
+        app.party_session = Some(sync::PartySession {
+          role: sync::PartyRole::Host,
+          code: String::new(),
+          guests: Vec::new(),
+          control_mode,
+          host_name: "Host".to_string(),
+        });
+      }
+      Err(e) => {
+        let mut app = self.app.lock().await;
+        app.party_status = sync::PartyStatus::Disconnected;
+        app.handle_error(anyhow!("Failed to start party: {}", e));
+      }
+    }
+  }
+
+  async fn join_party(&mut self, code: String, name: String) {
+    {
+      let mut app = self.app.lock().await;
+      app.party_status = sync::PartyStatus::Connecting;
+    }
+
+    let relay_url = {
+      let app = self.app.lock().await;
+      app.user_config.behavior.relay_server_url.clone()
+    };
+
+    match sync::connect_to_relay(&relay_url, "join", &[("code", &code), ("name", &name)]).await {
+      Ok((conn, read)) => {
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(sync::start_party_reader(read, incoming_tx));
+        self.party_connection = Some(conn);
+        self.party_incoming_rx = Some(incoming_rx);
+
+        let mut app = self.app.lock().await;
+        app.party_status = sync::PartyStatus::Joined;
+        app.party_session = Some(sync::PartySession {
+          role: sync::PartyRole::Guest,
+          code: code.to_uppercase(),
+          guests: Vec::new(),
+          control_mode: sync::ControlMode::default(),
+          host_name: String::new(),
+        });
+      }
+      Err(e) => {
+        let mut app = self.app.lock().await;
+        app.party_status = sync::PartyStatus::Disconnected;
+        app.handle_error(anyhow!("Failed to join party: {}", e));
+      }
+    }
+  }
+
+  async fn leave_party(&mut self) {
+    if let Some(conn) = &mut self.party_connection {
+      conn.close().await;
+    }
+    self.party_connection = None;
+    self.party_incoming_rx = None;
+
+    let mut app = self.app.lock().await;
+    app.party_status = sync::PartyStatus::Disconnected;
+    app.party_session = None;
+  }
+
+  async fn sync_playback(&mut self) {
+    let sync_state = {
+      let app = self.app.lock().await;
+      let session = match &app.party_session {
+        Some(s) if s.role == sync::PartyRole::Host => s,
+        _ => return,
+      };
+      let _ = session;
+
+      let (track_uri, is_playing) = match &app.current_playback_context {
+        Some(ctx) => {
+          let uri = match &ctx.item {
+            Some(rspotify::model::PlayableItem::Track(t)) => {
+              t.id.as_ref().map(|id| id.uri()).unwrap_or_default()
+            }
+            Some(rspotify::model::PlayableItem::Episode(e)) => e.id.uri(),
+            None => return,
+          };
+          (uri, ctx.is_playing)
+        }
+        None => return,
+      };
+
+      sync::SyncMessage::SyncState {
+        track_uri,
+        position_ms: app.song_progress_ms as u64,
+        is_playing,
+        timestamp: sync::now_ms(),
+      }
+    };
+
+    if let Some(conn) = &mut self.party_connection {
+      if let Err(e) = conn.send(&sync_state).await {
+        log::error!("Failed to send sync state: {}", e);
+      }
+    }
+  }
+
+  async fn set_party_control_mode(&mut self, control_mode: sync::ControlMode) {
+    let control_mode = match control_mode {
+      sync::ControlMode::HostOnly => "host_only",
+      sync::ControlMode::SharedControl => "shared_control",
+    };
+
+    let msg = sync::SyncMessage::SetControlMode {
+      control_mode: control_mode.to_string(),
+    };
+
+    if let Some(conn) = &mut self.party_connection {
+      if let Err(e) = conn.send(&msg).await {
+        log::error!("Failed to send control mode update: {}", e);
+      }
+    }
+  }
+
+  async fn party_playback_command(&mut self, action: sync::PlaybackAction) {
+    let msg = sync::SyncMessage::PlaybackCommand { action, from: None };
+    if let Some(conn) = &mut self.party_connection {
+      if let Err(e) = conn.send(&msg).await {
+        log::error!("Failed to send playback command: {}", e);
+      }
+    }
+  }
+
+  pub async fn process_party_messages(&mut self) {
+    let messages: Vec<sync::SyncMessage> = {
+      match &mut self.party_incoming_rx {
+        Some(rx) => {
+          let mut msgs = Vec::new();
+          while let Ok(msg) = rx.try_recv() {
+            msgs.push(msg);
+          }
+          msgs
+        }
+        None => return,
+      }
+    };
+
+    for msg in messages {
+      match msg {
+        sync::SyncMessage::RoomCreated { code, .. } => {
+          let mut app = self.app.lock().await;
+          if let Some(session) = &mut app.party_session {
+            session.code = code;
+          }
+        }
+        sync::SyncMessage::JoinedRoom { host_name } => {
+          let mut app = self.app.lock().await;
+          if let Some(session) = &mut app.party_session {
+            session.host_name = host_name;
+          }
+        }
+        sync::SyncMessage::GuestJoined { name } => {
+          let mut app = self.app.lock().await;
+          if let Some(session) = &mut app.party_session {
+            if !session.guests.contains(&name) {
+              session.guests.push(name.clone());
+            }
+          }
+          app.status_message = Some(format!("{} joined the party", name));
+          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
+        }
+        sync::SyncMessage::GuestLeft { name } => {
+          let mut app = self.app.lock().await;
+          if let Some(session) = &mut app.party_session {
+            if let Some(pos) = session.guests.iter().position(|g| g == &name) {
+              session.guests.remove(pos);
+            }
+          }
+          app.status_message = Some(format!("{} left the party", name));
+          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
+        }
+        sync::SyncMessage::SetControlMode { control_mode } => {
+          let mut app = self.app.lock().await;
+          if let Some(session) = &mut app.party_session {
+            session.control_mode = match control_mode.as_str() {
+              "shared_control" => sync::ControlMode::SharedControl,
+              _ => sync::ControlMode::HostOnly,
+            };
+          }
+        }
+        sync::SyncMessage::SyncState {
+          track_uri,
+          position_ms,
+          is_playing,
+          timestamp,
+        } => {
+          self
+            .handle_incoming_sync_state(track_uri, position_ms, is_playing, timestamp)
+            .await;
+        }
+        sync::SyncMessage::PlaybackCommand { action, .. } => {
+          self.handle_incoming_playback_command(action).await;
+        }
+        sync::SyncMessage::RoomClosed => {
+          self.party_connection = None;
+          let mut app = self.app.lock().await;
+          app.party_status = sync::PartyStatus::Disconnected;
+          app.party_session = None;
+          app.status_message = Some("Party ended".to_string());
+          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(5));
+        }
+        sync::SyncMessage::Error { message } => {
+          self.party_connection = None;
+          self.party_incoming_rx = None;
+          let mut app = self.app.lock().await;
+          app.party_status = sync::PartyStatus::Disconnected;
+          app.party_session = None;
+          app.handle_error(anyhow!("Party: {}", message));
+        }
+        _ => {}
+      }
+    }
+  }
+
+  async fn handle_incoming_sync_state(
+    &mut self,
+    track_uri: String,
+    position_ms: u64,
+    is_playing: bool,
+    timestamp: u64,
+  ) {
+    let is_guest = {
+      let app = self.app.lock().await;
+      matches!(
+        &app.party_session,
+        Some(s) if s.role == sync::PartyRole::Guest
+      )
+    };
+    if !is_guest {
+      return;
+    }
+
+    // Latency compensation: estimate how much time passed since the host sent this state
+    let now = sync::now_ms();
+    let transit_ms = if now > timestamp {
+      (now - timestamp).min(5000) // cap at 5s to avoid wild jumps from clock skew
+    } else {
+      0
+    };
+    let compensated_position = if is_playing {
+      position_ms + transit_ms
+    } else {
+      position_ms
+    };
+
+    let (current_uri, current_is_playing, current_progress) = {
+      let app = self.app.lock().await;
+      let uri = match &app.current_playback_context {
+        Some(ctx) => match &ctx.item {
+          Some(rspotify::model::PlayableItem::Track(t)) => {
+            t.id.as_ref().map(|id| id.uri()).unwrap_or_default()
+          }
+          Some(rspotify::model::PlayableItem::Episode(e)) => e.id.uri(),
+          None => String::new(),
+        },
+        None => String::new(),
+      };
+      let playing = app
+        .current_playback_context
+        .as_ref()
+        .map(|c| c.is_playing)
+        .unwrap_or(false);
+      let progress = app.song_progress_ms as u64;
+      (uri, playing, progress)
+    };
+
+    let mut switched_track = false;
+
+    // Track change takes priority
+    if current_uri != track_uri && !track_uri.is_empty() {
+      let playable: Option<PlayableId<'static>> = if let Ok(id) = TrackId::from_uri(&track_uri) {
+        let p: PlayableId<'_> = id.into();
+        Some(p.into_static())
+      } else if let Ok(id) = EpisodeId::from_uri(&track_uri) {
+        let p: PlayableId<'_> = id.into();
+        Some(p.into_static())
+      } else {
+        None
+      };
+      if let Some(playable_id) = playable {
+        self
+          .start_playback(None, Some(vec![playable_id]), None)
+          .await;
+        switched_track = true;
+      }
+    }
+
+    // Play/pause sync
+    // After a track switch, explicitly apply host pause state since starting playback may
+    // begin playing even when host is paused.
+    if (switched_track && !is_playing) || (!switched_track && current_is_playing != is_playing) {
+      if is_playing {
+        self.start_playback(None, None, None).await;
+      } else {
+        self.pause_playback().await;
+      }
+    }
+
+    // Position drift correction (>3s triggers seek)
+    let drift = current_progress.abs_diff(compensated_position);
+
+    if drift > 3000 && current_uri == track_uri {
+      self.seek(compensated_position as u32).await;
+    }
+  }
+
+  async fn handle_incoming_playback_command(&mut self, action: sync::PlaybackAction) {
+    let is_host = {
+      let app = self.app.lock().await;
+      matches!(
+        &app.party_session,
+        Some(s) if s.role == sync::PartyRole::Host
+      )
+    };
+    if !is_host {
+      return;
+    }
+
+    match action {
+      sync::PlaybackAction::Play => {
+        self.start_playback(None, None, None).await;
+      }
+      sync::PlaybackAction::Pause => {
+        self.pause_playback().await;
+      }
+      sync::PlaybackAction::NextTrack => {
+        self.next_track().await;
+      }
+      sync::PlaybackAction::PrevTrack => {
+        self.previous_track().await;
+      }
+      sync::PlaybackAction::Seek { position_ms } => {
+        self.seek(position_ms as u32).await;
+      }
+      sync::PlaybackAction::PlayTrack { uri } => {
+        let playable: Option<PlayableId<'static>> = if let Ok(id) = TrackId::from_uri(&uri) {
+          let p: PlayableId<'_> = id.into();
+          Some(p.into_static())
+        } else if let Ok(id) = EpisodeId::from_uri(&uri) {
+          let p: PlayableId<'_> = id.into();
+          Some(p.into_static())
+        } else {
+          None
+        };
+        if let Some(playable_id) = playable {
+          self
+            .start_playback(None, Some(vec![playable_id]), None)
+            .await;
+        }
+      }
+    }
+
+    // After executing, broadcast updated state
+    self.sync_playback().await;
   }
 }

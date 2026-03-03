@@ -36,6 +36,7 @@ pub trait PlaybackNetwork {
   async fn ensure_playback_continues(&mut self, previous_track_id: String);
   #[allow(dead_code)]
   async fn add_item_to_queue(&mut self, item: PlayableId<'static>);
+  async fn get_queue(&mut self);
   #[allow(dead_code)]
   async fn start_collection_playback(&mut self, offset: usize);
 }
@@ -796,6 +797,22 @@ impl PlaybackNetwork for Network {
       Err(e) => {
         let mut app = self.app.lock().await;
         app.handle_error(anyhow!(e));
+      }
+    }
+  }
+
+  async fn get_queue(&mut self) {
+    match self.spotify.current_user_queue().await {
+      Ok(q) => {
+        let mut app = self.app.lock().await;
+        app.queue = Some(q);
+      }
+      Err(e) => {
+        let mut app = self.app.lock().await;
+        app.queue = None;
+        app.status_message = Some("Could not load queue (no active device?)".to_string());
+        app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
+        log::warn!("get_queue failed: {}", e);
       }
     }
   }
