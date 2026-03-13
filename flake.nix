@@ -19,8 +19,8 @@
         packages = rec {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "spotatui";
-            version = "0.36.3-debug.1";
-            src = ./.;
+            version = "${(builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version}-${self.shortRev or "dirty"}";
+            src = self;
 
             cargoLock = {
               lockFile = ./Cargo.lock;
