@@ -121,6 +121,10 @@ yay -S spotatui-bin
 
 # Arch Linux (AUR) - build from source
 yay -S spotatui
+
+# Void Linux (Unoffical Repo)
+echo repository=https://raw.githubusercontent.com/Event-Horizon-VL/blackhole-vl/repository-x86_64 | sudo tee /etc/xbps.d/20-repository-extra.conf
+sudo xbps-install -S spotatui
 ```
 ```nix
 # NixOS (Flake)
