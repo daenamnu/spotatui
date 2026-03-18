@@ -25,7 +25,7 @@ use rspotify::{
 };
 use std::cell::Cell;
 use std::sync::mpsc::Sender;
-#[cfg(feature = "streaming")]
+#[cfg(any(feature = "streaming", all(feature = "mpris", target_os = "linux")))]
 use std::sync::Arc;
 use std::{
   cmp::{max, min},
@@ -3518,8 +3518,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-  use crate::core::test_helpers::{private_user, simplified_playlist};
   use super::*;
+  use crate::core::test_helpers::{private_user, simplified_playlist};
   use chrono::{Duration as ChronoDuration, Utc};
   use rspotify::model::{artist::SimplifiedArtist, idtypes::PlaylistId};
   use rspotify::prelude::Id;
