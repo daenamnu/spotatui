@@ -393,7 +393,7 @@ impl StreamingPlayer {
       match timeout(Duration::from_secs(init_timeout_secs), spirc_new).await {
         Ok(Ok(result)) => break result,
         Ok(Err(e)) if used_cached_credentials && !retried_with_fresh_credentials => {
-          println!(
+          warn!(
             "Cached streaming credentials failed ({:?}); retrying with a fresh OAuth login",
             e
           );
@@ -403,22 +403,16 @@ impl StreamingPlayer {
           retried_with_fresh_credentials = true;
         }
         Ok(Err(e)) => {
-          println!("Spirc creation error: {:?}", e);
+          warn!("Spirc creation error: {:?}", e);
           return Err(anyhow!("Failed to create Spirc: {:?}", e));
         }
-        Err(_) if used_cached_credentials && !retried_with_fresh_credentials => {
-          println!(
-            "Spirc initialization with cached credentials timed out after {}s; retrying with a fresh OAuth login",
-            init_timeout_secs
-          );
-          clear_cached_streaming_credentials(&cache_path);
-          credentials = request_streaming_oauth_credentials()?;
-          used_cached_credentials = false;
-          retried_with_fresh_credentials = true;
-        }
         Err(_) => {
+          // Timeout means the network was slow, not that credentials are bad.
+          // Do NOT clear credentials, they may be valid for the next startup.
+          // Streaming is skipped for this session; main.rs falls back to Web API.
           return Err(anyhow!(
-            "Spirc initialization timed out after {}s (set SPOTATUI_STREAMING_INIT_TIMEOUT_SECS to adjust)",
+            "Spirc initialization timed out after {}s. Streaming skipped for this session. \
+             Set SPOTATUI_STREAMING_INIT_TIMEOUT_SECS to adjust.",
             init_timeout_secs
           ));
         }
@@ -507,7 +501,7 @@ impl StreamingPlayer {
     let _ = self.spirc.next();
   }
 
-  /// Skip to the previous track  
+  /// Skip to the previous track
   pub fn prev(&self) {
     let _ = self.spirc.prev();
   }
@@ -618,6 +612,77 @@ impl StreamingPlayer {
 
 // Re-export PlayerEvent for use in other modules
 pub use librespot_playback::player::PlayerEvent;
+
+#[cfg(test)]
+mod tests {
+  enum SpircOutcome {
+    Success,
+    AuthFailure(String),
+    Timeout,
+  }
+
+  fn should_retry_with_fresh_credentials(
+    outcome: &SpircOutcome,
+    used_cached: bool,
+    already_retried: bool,
+  ) -> bool {
+    matches!(outcome, SpircOutcome::AuthFailure(_)) && used_cached && !already_retried
+  }
+
+  #[test]
+  fn auth_failure_with_cached_creds_triggers_retry() {
+    assert!(should_retry_with_fresh_credentials(
+      &SpircOutcome::AuthFailure("bad token".into()),
+      true,
+      false,
+    ));
+  }
+
+  #[test]
+  fn timeout_with_cached_creds_does_not_trigger_retry() {
+    assert!(!should_retry_with_fresh_credentials(
+      &SpircOutcome::Timeout,
+      true,
+      false,
+    ));
+  }
+
+  #[test]
+  fn auth_failure_with_fresh_creds_does_not_trigger_retry() {
+    assert!(!should_retry_with_fresh_credentials(
+      &SpircOutcome::AuthFailure("bad token".into()),
+      false,
+      false,
+    ));
+  }
+
+  #[test]
+  fn timeout_with_fresh_creds_does_not_trigger_retry() {
+    assert!(!should_retry_with_fresh_credentials(
+      &SpircOutcome::Timeout,
+      false,
+      false,
+    ));
+  }
+
+  #[test]
+  fn auth_failure_already_retried_does_not_trigger_second_retry() {
+    assert!(!should_retry_with_fresh_credentials(
+      &SpircOutcome::AuthFailure("bad token".into()),
+      true,
+      true,
+    ));
+  }
+
+  #[test]
+  fn success_never_triggers_retry() {
+    assert!(!should_retry_with_fresh_credentials(
+      &SpircOutcome::Success,
+      true,
+      false,
+    ));
+  }
+}
 
 /// Helper to get the default cache path for streaming
 pub fn get_default_cache_path() -> Option<PathBuf> {
