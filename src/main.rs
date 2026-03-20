@@ -1161,7 +1161,7 @@ of the app. Beware that this comes at a CPU cost!",
     // Save, because we checked if the subcommand is present at runtime
     let m = matches.subcommand_matches(cmd).unwrap();
     #[cfg(feature = "streaming")]
-    let network = Network::new(spotify, client_config, &app, None); // CLI doesn't use streaming
+    let network = Network::new(spotify, client_config, &app); // CLI doesn't use streaming
     #[cfg(not(feature = "streaming"))]
     let network = Network::new(spotify, client_config, &app);
     println!(
@@ -1265,9 +1265,7 @@ of the app. Beware that this comes at a CPU cost!",
       app_mut.streaming_player = streaming_player.clone();
     }
 
-    // Clone streaming player and device name for use in network spawn
-    #[cfg(feature = "streaming")]
-    let streaming_player_clone = streaming_player.clone();
+    // Clone the device name for startup device selection in the network task.
     #[cfg(feature = "streaming")]
     let streaming_device_name = streaming_player
       .as_ref()
@@ -1294,6 +1292,9 @@ of the app. Beware that this comes at a CPU cost!",
     let shared_position_for_mpris = Arc::clone(&shared_position);
     #[cfg(all(feature = "macos-media", target_os = "macos"))]
     let shared_is_playing_for_macos = Arc::clone(&shared_is_playing);
+    #[cfg(feature = "streaming")]
+    let (streaming_recovery_tx, mut streaming_recovery_rx) =
+      tokio::sync::mpsc::unbounded_channel::<StreamingRecoveryRequest>();
 
     // Initialize MPRIS D-Bus integration for desktop media control
     // This registers spotatui as a controllable media player on the session bus
@@ -1389,14 +1390,9 @@ of the app. Beware that this comes at a CPU cost!",
     #[cfg(all(feature = "macos-media", target_os = "macos"))]
     if let Some(ref macos_media) = macos_media_manager {
       if let Some(event_rx) = macos_media.take_event_rx() {
-        let streaming_player_for_macos = streaming_player.clone();
+        let app_for_macos = Arc::clone(&app);
         tokio::spawn(async move {
-          handle_macos_media_events(
-            event_rx,
-            streaming_player_for_macos,
-            shared_is_playing_for_macos,
-          )
-          .await;
+          handle_macos_media_events(event_rx, app_for_macos, shared_is_playing_for_macos).await;
         });
       }
     }
@@ -1435,21 +1431,97 @@ of the app. Beware that this comes at a CPU cost!",
     // Spawn player event listener (updates app state from native player events)
     #[cfg(feature = "streaming")]
     if let Some(ref player) = streaming_player {
-      let event_rx = player.get_event_channel();
-      let app_for_events = Arc::clone(&app);
-      info!("spawning native player event handler");
+      spawn_player_event_handler(PlayerEventContext {
+        player: Arc::clone(player),
+        app: Arc::clone(&app),
+        shared_position: shared_position_for_events,
+        shared_is_playing: shared_is_playing_for_events,
+        recovery_tx: streaming_recovery_tx.clone(),
+        #[cfg(all(feature = "mpris", target_os = "linux"))]
+        mpris_manager: mpris_for_events,
+        #[cfg(all(feature = "macos-media", target_os = "macos"))]
+        macos_media_manager: macos_media_for_events,
+      });
+    }
+
+    #[cfg(feature = "streaming")]
+    {
+      let app_for_recovery = Arc::clone(&app);
+      let shared_position_for_recovery = Arc::clone(&shared_position);
+      let shared_is_playing_for_recovery = Arc::clone(&shared_is_playing);
+      let recovery_tx = streaming_recovery_tx.clone();
+      let recovery_client_config = client_config.clone();
+      let recovery_redirect_uri = selected_redirect_uri.clone();
+      #[cfg(all(feature = "mpris", target_os = "linux"))]
+      let mpris_for_recovery = mpris_manager.clone();
+      #[cfg(all(feature = "macos-media", target_os = "macos"))]
+      let macos_media_for_recovery = macos_media_manager.clone();
+
       tokio::spawn(async move {
-        handle_player_events(
-          event_rx,
-          app_for_events,
-          shared_position_for_events,
-          shared_is_playing_for_events,
-          #[cfg(all(feature = "mpris", target_os = "linux"))]
-          mpris_for_events,
-          #[cfg(all(feature = "macos-media", target_os = "macos"))]
-          macos_media_for_events,
-        )
-        .await;
+        while let Some(mut request) = streaming_recovery_rx.recv().await {
+          while let Ok(next_request) = streaming_recovery_rx.try_recv() {
+            request.reselect_device |= next_request.reselect_device;
+          }
+
+          if active_streaming_player(&app_for_recovery).await.is_some() {
+            continue;
+          }
+
+          let initial_volume = {
+            let app = app_for_recovery.lock().await;
+            app.user_config.behavior.volume_percent
+          };
+
+          let streaming_config = player::StreamingConfig {
+            device_name: recovery_client_config.streaming_device_name.clone(),
+            bitrate: recovery_client_config.streaming_bitrate,
+            audio_cache: recovery_client_config.streaming_audio_cache,
+            cache_path: player::get_default_cache_path(),
+            initial_volume,
+          };
+
+          info!("attempting native streaming recovery");
+
+          match player::StreamingPlayer::new_cache_only(
+            &recovery_client_config.client_id,
+            &recovery_redirect_uri,
+            streaming_config,
+          )
+          .await
+          {
+            Ok(recovered_player) => {
+              let recovered_player = Arc::new(recovered_player);
+              {
+                let mut app = app_for_recovery.lock().await;
+                app.streaming_player = Some(Arc::clone(&recovered_player));
+                app.set_status_message("Native streaming recovered.", 6);
+                if request.reselect_device {
+                  app.dispatch(IoEvent::AutoSelectStreamingDevice(
+                    recovery_client_config.streaming_device_name.clone(),
+                    false,
+                  ));
+                }
+              }
+
+              spawn_player_event_handler(PlayerEventContext {
+                player: recovered_player,
+                app: Arc::clone(&app_for_recovery),
+                shared_position: Arc::clone(&shared_position_for_recovery),
+                shared_is_playing: Arc::clone(&shared_is_playing_for_recovery),
+                recovery_tx: recovery_tx.clone(),
+                #[cfg(all(feature = "mpris", target_os = "linux"))]
+                mpris_manager: mpris_for_recovery.clone(),
+                #[cfg(all(feature = "macos-media", target_os = "macos"))]
+                macos_media_manager: macos_media_for_recovery.clone(),
+              });
+            }
+            Err(e) => {
+              info!("native streaming recovery failed: {}", e);
+              let mut app = app_for_recovery.lock().await;
+              app.set_status_message(format!("Native recovery failed: {}", e), 8);
+            }
+          }
+        }
       });
     }
 
@@ -1457,7 +1529,7 @@ of the app. Beware that this comes at a CPU cost!",
     info!("spawning spotify network event handler");
     tokio::spawn(async move {
       #[cfg(feature = "streaming")]
-      let mut network = Network::new(spotify, client_config, &app, streaming_player_clone);
+      let mut network = Network::new(spotify, client_config, &app);
       #[cfg(not(feature = "streaming"))]
       let mut network = Network::new(spotify, client_config, &app);
 
@@ -1589,9 +1661,11 @@ async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, network: &mut Ne
 #[cfg(feature = "streaming")]
 async fn handle_player_events(
   mut event_rx: librespot_playback::player::PlayerEventChannel,
+  player: Arc<player::StreamingPlayer>,
   app: Arc<Mutex<App>>,
   shared_position: Arc<AtomicU64>,
   shared_is_playing: Arc<std::sync::atomic::AtomicBool>,
+  recovery_tx: tokio::sync::mpsc::UnboundedSender<StreamingRecoveryRequest>,
   #[cfg(all(feature = "mpris", target_os = "linux"))] mpris_manager: Option<
     Arc<mpris::MprisManager>,
   >,
@@ -1604,6 +1678,10 @@ async fn handle_player_events(
   use std::sync::atomic::Ordering;
 
   while let Some(event) = event_rx.recv().await {
+    if !is_current_streaming_player(&app, &player).await {
+      continue;
+    }
+
     // Use try_lock() to avoid blocking when the UI thread is busy
     // If we can't get the lock, skip this update - the UI will catch up on the next tick
     match event {
@@ -1892,11 +1970,181 @@ async fn handle_player_events(
           macos_media.set_position(position_ms as u64);
         }
       }
+      PlayerEvent::SessionDisconnected { .. } => {
+        #[cfg(all(feature = "mpris", target_os = "linux"))]
+        if let Some(ref mpris) = mpris_manager {
+          mpris.set_stopped();
+        }
+
+        #[cfg(all(feature = "macos-media", target_os = "macos"))]
+        if let Some(ref macos_media) = macos_media_manager {
+          macos_media.set_stopped();
+        }
+
+        if let Some(request) = disconnect_streaming_player(
+          &app,
+          &player,
+          &shared_position,
+          &shared_is_playing,
+          "Native streaming disconnected; attempting recovery.",
+        )
+        .await
+        {
+          let _ = recovery_tx.send(request);
+        }
+        return;
+      }
       _ => {
         // Ignore other events
       }
     }
   }
+
+  if let Some(request) = disconnect_streaming_player(
+    &app,
+    &player,
+    &shared_position,
+    &shared_is_playing,
+    "Native streaming stopped; attempting recovery.",
+  )
+  .await
+  {
+    let _ = recovery_tx.send(request);
+  }
+}
+
+#[cfg(feature = "streaming")]
+#[derive(Clone, Copy, Default)]
+struct StreamingRecoveryRequest {
+  reselect_device: bool,
+}
+
+/// Bundled context for player event handling tasks.
+/// Groups all shared state and managers needed by event handlers.
+#[cfg(feature = "streaming")]
+struct PlayerEventContext {
+  player: Arc<player::StreamingPlayer>,
+  app: Arc<Mutex<App>>,
+  shared_position: Arc<AtomicU64>,
+  shared_is_playing: Arc<std::sync::atomic::AtomicBool>,
+  recovery_tx: tokio::sync::mpsc::UnboundedSender<StreamingRecoveryRequest>,
+  #[cfg(all(feature = "mpris", target_os = "linux"))]
+  mpris_manager: Option<Arc<mpris::MprisManager>>,
+  #[cfg(all(feature = "macos-media", target_os = "macos"))]
+  macos_media_manager: Option<Arc<macos_media::MacMediaManager>>,
+}
+
+/// Get the currently active streaming player (if any).
+/// This is logically identical to `current_streaming_player` in src/infra/network/playback.rs.
+/// The difference: this function takes `&Arc<Mutex<App>>` directly (used in main.rs event handlers),
+/// while `current_streaming_player` takes `&Network` (used in playback API code).
+/// Future refactor: consolidate to a shared location like `src/core/app.rs`.
+#[cfg(feature = "streaming")]
+async fn active_streaming_player(app: &Arc<Mutex<App>>) -> Option<Arc<player::StreamingPlayer>> {
+  let app_lock = app.lock().await;
+  app_lock.streaming_player.clone()
+}
+
+#[cfg(feature = "streaming")]
+async fn is_current_streaming_player(
+  app: &Arc<Mutex<App>>,
+  player: &Arc<player::StreamingPlayer>,
+) -> bool {
+  // Pointer identity determines whether an event belongs to the active player.
+  // Do not reject disconnected players here: SessionDisconnected still needs to
+  // reach the handler so the recovery path can run.
+  let app_lock = app.lock().await;
+  app_lock
+    .streaming_player
+    .as_ref()
+    .is_some_and(|current| Arc::ptr_eq(current, player))
+}
+
+#[cfg(feature = "streaming")]
+fn current_playback_matches_native(app: &App, player: &player::StreamingPlayer) -> bool {
+  let Some(ctx) = app.current_playback_context.as_ref() else {
+    return app.is_streaming_active;
+  };
+
+  if let Some(native_id) = app.native_device_id.as_ref() {
+    if ctx.device.id.as_ref() == Some(native_id) {
+      return true;
+    }
+  }
+
+  ctx.device.name.eq_ignore_ascii_case(player.device_name())
+}
+
+#[cfg(feature = "streaming")]
+async fn disconnect_streaming_player(
+  app: &Arc<Mutex<App>>,
+  player: &Arc<player::StreamingPlayer>,
+  shared_position: &Arc<AtomicU64>,
+  shared_is_playing: &Arc<std::sync::atomic::AtomicBool>,
+  status_message: &str,
+) -> Option<StreamingRecoveryRequest> {
+  let mut app_lock = app.lock().await;
+  let Some(current_player) = app_lock.streaming_player.as_ref() else {
+    return None;
+  };
+  if !Arc::ptr_eq(current_player, player) {
+    return None;
+  }
+
+  let reselect_device = current_playback_matches_native(&app_lock, player);
+
+  app_lock.streaming_player = None;
+  app_lock.is_streaming_active = false;
+  app_lock.native_activation_pending = false;
+  app_lock.native_device_id = None;
+  app_lock.native_is_playing = Some(false);
+  app_lock.native_track_info = None;
+  app_lock.song_progress_ms = 0;
+  app_lock.last_track_id = None;
+  app_lock.last_device_activation = None;
+  app_lock.seek_ms = None;
+  if reselect_device {
+    app_lock.current_playback_context = None;
+  }
+  app_lock.set_status_message(status_message, 8);
+  app_lock.dispatch(IoEvent::GetCurrentPlayback);
+
+  shared_position.store(0, Ordering::Relaxed);
+  shared_is_playing.store(false, Ordering::Relaxed);
+
+  Some(StreamingRecoveryRequest { reselect_device })
+}
+
+#[cfg(feature = "streaming")]
+fn spawn_player_event_handler(ctx: PlayerEventContext) {
+  let event_rx = ctx.player.get_event_channel();
+  info!("spawning native player event handler");
+
+  let player = ctx.player.clone();
+  let app = Arc::clone(&ctx.app);
+  let shared_position = Arc::clone(&ctx.shared_position);
+  let shared_is_playing = Arc::clone(&ctx.shared_is_playing);
+  let recovery_tx = ctx.recovery_tx.clone();
+  #[cfg(all(feature = "mpris", target_os = "linux"))]
+  let mpris_manager = ctx.mpris_manager.clone();
+  #[cfg(all(feature = "macos-media", target_os = "macos"))]
+  let macos_media_manager = ctx.macos_media_manager.clone();
+
+  tokio::spawn(async move {
+    handle_player_events(
+      event_rx,
+      player,
+      app,
+      shared_position,
+      shared_is_playing,
+      recovery_tx,
+      #[cfg(all(feature = "mpris", target_os = "linux"))]
+      mpris_manager,
+      #[cfg(all(feature = "macos-media", target_os = "macos"))]
+      macos_media_manager,
+    )
+    .await;
+  });
 }
 
 /// Handle MPRIS events from external clients (media keys, playerctl, etc.)
@@ -2098,18 +2346,17 @@ async fn handle_mpris_events(
 #[cfg(all(feature = "macos-media", target_os = "macos"))]
 async fn handle_macos_media_events(
   mut event_rx: tokio::sync::mpsc::UnboundedReceiver<macos_media::MacMediaEvent>,
-  streaming_player: Option<Arc<player::StreamingPlayer>>,
+  app: Arc<Mutex<App>>,
   shared_is_playing: Arc<std::sync::atomic::AtomicBool>,
 ) {
   use macos_media::MacMediaEvent;
   use std::sync::atomic::Ordering;
 
-  let Some(player) = streaming_player else {
-    // No streaming player, nothing to control
-    return;
-  };
-
   while let Some(event) = event_rx.recv().await {
+    let Some(player) = active_streaming_player(&app).await else {
+      continue;
+    };
+
     match event {
       MacMediaEvent::PlayPause => {
         // Toggle based on atomic state (lock-free, always up-to-date)

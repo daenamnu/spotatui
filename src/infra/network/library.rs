@@ -304,7 +304,12 @@ impl LibraryNetwork for Network {
     }
 
     #[cfg(feature = "streaming")]
-    let folder_nodes = fetch_rootlist_folders(&self.streaming_player).await;
+    let streaming_player = {
+      let app = self.app.lock().await;
+      app.streaming_player.clone()
+    };
+    #[cfg(feature = "streaming")]
+    let folder_nodes = fetch_rootlist_folders(streaming_player).await;
     #[cfg(not(feature = "streaming"))]
     let folder_nodes: Option<Vec<PlaylistFolderNode>> = None;
 
@@ -860,9 +865,9 @@ mod tests {
 
 #[cfg(feature = "streaming")]
 async fn fetch_rootlist_folders(
-  streaming_player: &Option<Arc<StreamingPlayer>>,
+  streaming_player: Option<Arc<StreamingPlayer>>,
 ) -> Option<Vec<PlaylistFolderNode>> {
-  let player = streaming_player.as_ref()?;
+  let player = streaming_player?;
   let session = player.session();
 
   let bytes = match session.spclient().get_rootlist(0, Some(100_000)).await {

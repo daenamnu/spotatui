@@ -7,13 +7,15 @@ use chrono::TimeDelta;
 use rspotify::model::{
   enums::RepeatState,
   idtypes::{PlayContextId, PlayableId},
-  PlayableItem,
+  Offset, PlayableItem,
 };
 use rspotify::prelude::*;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "streaming")]
 use librespot_connect::{LoadRequest, LoadRequestOptions, PlayingTrack};
+#[cfg(feature = "streaming")]
+use std::sync::Arc;
 
 const MAX_API_PLAYBACK_URIS: usize = 100;
 
@@ -69,25 +71,42 @@ fn trim_api_playback_uris(
   (trimmed_uris, Some(selected_index - start))
 }
 
+fn api_playback_offset(
+  context_uris: Option<&[PlayableId<'static>]>,
+  offset: Option<usize>,
+) -> Option<Offset> {
+  if let Some(first_uri) = context_uris.and_then(|uris| uris.first()) {
+    return Some(Offset::Uri(first_uri.uri()));
+  }
+
+  offset.map(|index| Offset::Position(ChronoDuration::milliseconds(index as i64)))
+}
+
+/// Get the currently active streaming player, if any.
+/// Note: This logic is duplicated in `main.rs` as `active_streaming_player()`.
+/// Both are identical; the difference is input type (Network vs. App Arc).
+/// A future refactor could consolidate to a shared location like `src/core/app.rs`.
+#[cfg(feature = "streaming")]
+async fn current_streaming_player(
+  network: &Network,
+) -> Option<Arc<crate::infra::player::StreamingPlayer>> {
+  let app = network.app.lock().await;
+  app.streaming_player.clone()
+}
+
 #[cfg(feature = "streaming")]
 async fn is_native_streaming_active_for_playback(network: &Network) -> bool {
-  let player_connected = network
-    .streaming_player
-    .as_ref()
-    .is_some_and(|p| p.is_connected());
+  let app = network.app.lock().await;
+  let streaming_player = app.streaming_player.clone();
+  let player_connected = streaming_player.as_ref().is_some_and(|p| p.is_connected());
 
   if !player_connected {
     return false;
   }
 
-  // Get native device name once (no lock needed)
-  let native_device_name = network
-    .streaming_player
+  let native_device_name = streaming_player
     .as_ref()
     .map(|p| p.device_name().to_lowercase());
-
-  // Single lock acquisition - check all conditions in one go
-  let app = network.app.lock().await;
 
   // If no context yet (e.g., at startup), use the app state flag which is
   // set when the native streaming device is activated/selected.
@@ -116,25 +135,21 @@ async fn is_native_streaming_active_for_playback(network: &Network) -> bool {
   false
 }
 
-#[cfg(feature = "streaming")]
-fn is_native_streaming_active(network: &Network) -> bool {
-  network
-    .streaming_player
-    .as_ref()
-    .is_some_and(|p| p.is_connected())
-}
-
 impl PlaybackNetwork for Network {
   async fn get_current_playback(&mut self) {
     // When using native streaming, the Spotify API returns stale server-side state
     // that doesn't reflect recent local changes (volume, shuffle, repeat, play/pause).
     // We need to preserve these local states and restore them after getting the API response.
     #[cfg(feature = "streaming")]
+    let streaming_player = current_streaming_player(self).await;
+    #[cfg(feature = "streaming")]
+    // Check if native streaming is active by examining the pre-fetched player
+    // (avoids redundant lock call from is_native_streaming_active)
     let local_state: Option<(Option<u8>, bool, rspotify::model::RepeatState, Option<bool>)> =
-      if is_native_streaming_active(self) {
+      if streaming_player.as_ref().is_some_and(|p| p.is_connected()) {
         let app = self.app.lock().await;
         if let Some(ref ctx) = app.current_playback_context {
-          let volume = self.streaming_player.as_ref().map(|p| p.get_volume());
+          let volume = streaming_player.as_ref().map(|p| p.get_volume());
           Some((
             volume,
             ctx.shuffle_state,
@@ -164,7 +179,7 @@ impl PlaybackNetwork for Network {
 
         // Detect whether the native spotatui streaming device is the active Spotify device.
         #[cfg(feature = "streaming")]
-        let is_native_device = self.streaming_player.as_ref().is_some_and(|p| {
+        let is_native_device = streaming_player.as_ref().is_some_and(|p| {
           if let (Some(current_id), Some(native_id)) =
             (c.device.id.as_ref(), app.native_device_id.as_ref())
           {
@@ -236,7 +251,7 @@ impl PlaybackNetwork for Network {
         if local_state.is_none() && is_native_device {
           c.shuffle_state = app.user_config.behavior.shuffle_enabled;
           // Proactively set native shuffle on first load to keep backend in sync
-          if let Some(ref player) = self.streaming_player {
+          if let Some(ref player) = streaming_player {
             let _ = player.set_shuffle(app.user_config.behavior.shuffle_enabled);
           }
         }
@@ -386,7 +401,7 @@ impl PlaybackNetwork for Network {
     // Check if we should use native streaming for playback
     #[cfg(feature = "streaming")]
     if is_native_streaming_active_for_playback(self).await {
-      if let Some(ref player) = self.streaming_player {
+      if let Some(player) = current_streaming_player(self).await {
         let activation_time = Instant::now();
         let should_transfer = {
           let app = self.app.lock().await;
@@ -481,31 +496,32 @@ impl PlaybackNetwork for Network {
       }
     }
 
-    let offset_struct =
-      offset.map(|o| rspotify::model::Offset::Position(ChronoDuration::milliseconds(o as i64)));
-
-    let result = if let Some(context) = context_id {
-      self
-        .spotify
-        .start_context_playback(
-          context,
-          None, // device_id
-          offset_struct,
-          None, // position
-        )
-        .await
-    } else if let Some(track_uris) = uris {
-      self
-        .spotify
-        .start_uris_playback(
-          track_uris,
-          None, // device_id
-          offset_struct,
-          None, // position
-        )
-        .await
-    } else {
-      self.spotify.resume_playback(None, None).await
+    let result = match (context_id, uris) {
+      (Some(context), track_uris) => {
+        let offset_struct = api_playback_offset(track_uris.as_deref(), offset);
+        self
+          .spotify
+          .start_context_playback(
+            context,
+            None, // device_id
+            offset_struct,
+            None, // position
+          )
+          .await
+      }
+      (None, Some(track_uris)) => {
+        let offset_struct = api_playback_offset(None, offset);
+        self
+          .spotify
+          .start_uris_playback(
+            track_uris,
+            None, // device_id
+            offset_struct,
+            None, // position
+          )
+          .await
+      }
+      (None, None) => self.spotify.resume_playback(None, None).await,
     };
 
     match result {
@@ -533,7 +549,7 @@ impl PlaybackNetwork for Network {
     // Check if using native streaming
     #[cfg(feature = "streaming")]
     if is_native_streaming_active_for_playback(self).await {
-      if let Some(ref player) = self.streaming_player {
+      if let Some(player) = current_streaming_player(self).await {
         player.pause();
         // Update UI state immediately
         let mut app = self.app.lock().await;
@@ -561,7 +577,7 @@ impl PlaybackNetwork for Network {
   async fn next_track(&mut self) {
     #[cfg(feature = "streaming")]
     if is_native_streaming_active_for_playback(self).await {
-      if let Some(ref player) = self.streaming_player {
+      if let Some(player) = current_streaming_player(self).await {
         player.next();
         return;
       }
@@ -576,7 +592,7 @@ impl PlaybackNetwork for Network {
   async fn previous_track(&mut self) {
     #[cfg(feature = "streaming")]
     if is_native_streaming_active_for_playback(self).await {
-      if let Some(ref player) = self.streaming_player {
+      if let Some(player) = current_streaming_player(self).await {
         player.prev();
         return;
       }
@@ -591,7 +607,7 @@ impl PlaybackNetwork for Network {
   async fn force_previous_track(&mut self) {
     #[cfg(feature = "streaming")]
     if is_native_streaming_active_for_playback(self).await {
-      if let Some(ref player) = self.streaming_player {
+      if let Some(player) = current_streaming_player(self).await {
         player.prev();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         player.prev();
@@ -619,7 +635,7 @@ impl PlaybackNetwork for Network {
   async fn seek(&mut self, position_ms: u32) {
     #[cfg(feature = "streaming")]
     if is_native_streaming_active_for_playback(self).await {
-      if let Some(ref player) = self.streaming_player {
+      if let Some(player) = current_streaming_player(self).await {
         player.seek(position_ms);
         return;
       }
@@ -638,7 +654,7 @@ impl PlaybackNetwork for Network {
   async fn shuffle(&mut self, shuffle_state: bool) {
     #[cfg(feature = "streaming")]
     if is_native_streaming_active_for_playback(self).await {
-      if let Some(ref player) = self.streaming_player {
+      if let Some(player) = current_streaming_player(self).await {
         let _ = player.set_shuffle(shuffle_state);
         let mut app = self.app.lock().await;
         if let Some(ctx) = &mut app.current_playback_context {
@@ -665,7 +681,7 @@ impl PlaybackNetwork for Network {
   async fn repeat(&mut self, repeat_state: RepeatState) {
     #[cfg(feature = "streaming")]
     if is_native_streaming_active_for_playback(self).await {
-      if let Some(ref player) = self.streaming_player {
+      if let Some(player) = current_streaming_player(self).await {
         let _ = player.set_repeat(repeat_state);
         let mut app = self.app.lock().await;
         if let Some(ctx) = &mut app.current_playback_context {
@@ -692,7 +708,7 @@ impl PlaybackNetwork for Network {
   async fn change_volume(&mut self, volume: u8) {
     #[cfg(feature = "streaming")]
     if is_native_streaming_active_for_playback(self).await {
-      if let Some(ref player) = self.streaming_player {
+      if let Some(player) = current_streaming_player(self).await {
         player.set_volume(volume);
         let mut app = self.app.lock().await;
         if let Some(ctx) = &mut app.current_playback_context {
@@ -719,7 +735,8 @@ impl PlaybackNetwork for Network {
   async fn transfert_playback_to_device(&mut self, device_id: String, persist_device_id: bool) {
     #[cfg(feature = "streaming")]
     {
-      let is_native_transfer = if let Some(ref player) = self.streaming_player {
+      let streaming_player = current_streaming_player(self).await;
+      let is_native_transfer = if let Some(ref player) = streaming_player {
         let native_name = player.device_name().to_lowercase();
         let app = self.app.lock().await;
         let matches_cached_device = app.devices.as_ref().is_some_and(|payload| {
@@ -734,7 +751,7 @@ impl PlaybackNetwork for Network {
       };
 
       if is_native_transfer {
-        if let Some(ref player) = self.streaming_player {
+        if let Some(ref player) = streaming_player {
           let _ = player.transfer(None);
           player.activate();
           let mut app = self.app.lock().await;
@@ -772,7 +789,7 @@ impl PlaybackNetwork for Network {
   async fn auto_select_streaming_device(&mut self, device_name: String, persist_device_id: bool) {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    if let Some(ref player) = self.streaming_player {
+    if let Some(player) = current_streaming_player(self).await {
       let activation_time = Instant::now();
       let should_transfer = {
         let app = self.app.lock().await;
@@ -948,5 +965,42 @@ mod tests {
     assert_eq!(trimmed.len(), MAX_API_PLAYBACK_URIS);
     assert_eq!(offset, Some(99));
     assert_eq!(trimmed[offset.unwrap()].uri(), uris[149].uri());
+  }
+
+  #[test]
+  fn api_playback_offset_uses_track_uri_for_context_playback() {
+    let uris = vec![
+      playable_track("0000000000000000000001"),
+      playable_track("0000000000000000000002"),
+    ];
+
+    let offset = api_playback_offset(Some(&uris), Some(1));
+
+    assert_eq!(
+      offset,
+      Some(Offset::Uri(
+        "spotify:track:0000000000000000000001".to_string()
+      ))
+    );
+  }
+
+  #[test]
+  fn api_playback_offset_uses_position_for_uri_list_playback() {
+    let offset = api_playback_offset(None, Some(1));
+
+    assert_eq!(
+      offset,
+      Some(Offset::Position(ChronoDuration::milliseconds(1)))
+    );
+  }
+
+  #[test]
+  fn api_playback_offset_falls_back_to_position_when_context_has_no_uri() {
+    let offset = api_playback_offset(None, Some(3));
+
+    assert_eq!(
+      offset,
+      Some(Offset::Position(ChronoDuration::milliseconds(3)))
+    );
   }
 }

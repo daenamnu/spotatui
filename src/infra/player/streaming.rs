@@ -25,6 +25,7 @@ use log::{error, info, warn};
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
@@ -175,6 +176,31 @@ fn request_streaming_oauth_credentials() -> Result<Credentials> {
   Ok(Credentials::with_access_token(token.access_token))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamingAuthMode {
+  /// Default startup mode: use cache first, then fall back to browser OAuth.
+  InteractiveIfNeeded,
+  /// Recovery mode: only use cached credentials; never open a browser.
+  CacheOnly,
+}
+
+fn resolve_streaming_credentials(
+  cache: &Cache,
+  auth_mode: StreamingAuthMode,
+) -> Result<(Credentials, bool)> {
+  if let Some(cached_creds) = cache.credentials() {
+    info!("Using cached streaming credentials");
+    return Ok((cached_creds, true));
+  }
+
+  match auth_mode {
+    StreamingAuthMode::InteractiveIfNeeded => Ok((request_streaming_oauth_credentials()?, false)),
+    StreamingAuthMode::CacheOnly => Err(anyhow!(
+      "No cached streaming credentials found (cache-only recovery mode)"
+    )),
+  }
+}
+
 fn clear_cached_streaming_credentials(cache_path: &Option<PathBuf>) {
   let Some(credentials_path) = cache_path
     .as_ref()
@@ -255,6 +281,7 @@ pub struct StreamingPlayer {
   config: StreamingConfig,
   #[allow(dead_code)]
   state: Arc<Mutex<PlayerState>>,
+  spirc_alive: Arc<AtomicBool>,
 }
 
 #[allow(dead_code)]
@@ -274,6 +301,25 @@ impl StreamingPlayer {
   /// * `redirect_uri` - OAuth redirect URI (must match Spotify app settings)
   /// * `config` - Streaming configuration options
   pub async fn new(_client_id: &str, _redirect_uri: &str, config: StreamingConfig) -> Result<Self> {
+    Self::new_with_auth_mode(config, StreamingAuthMode::InteractiveIfNeeded).await
+  }
+
+  /// Create a new streaming player using ONLY cached credentials.
+  ///
+  /// This path is intended for runtime recovery flows where opening a browser
+  /// would be disruptive.
+  pub async fn new_cache_only(
+    _client_id: &str,
+    _redirect_uri: &str,
+    config: StreamingConfig,
+  ) -> Result<Self> {
+    Self::new_with_auth_mode(config, StreamingAuthMode::CacheOnly).await
+  }
+
+  async fn new_with_auth_mode(
+    config: StreamingConfig,
+    auth_mode: StreamingAuthMode,
+  ) -> Result<Self> {
     // Set up cache paths
     let cache_path = config.cache_path.clone().or_else(get_default_cache_path);
     let audio_cache_path = if config.audio_cache {
@@ -292,14 +338,9 @@ impl StreamingPlayer {
 
     let cache = Cache::new(cache_path.clone(), None, audio_cache_path, None)?;
 
-    // Try to get credentials from cache first
+    // Try to get credentials from cache first, then optionally fall back to OAuth.
     let (mut credentials, mut used_cached_credentials) =
-      if let Some(cached_creds) = cache.credentials() {
-        info!("Using cached streaming credentials");
-        (cached_creds, true)
-      } else {
-        (request_streaming_oauth_credentials()?, false)
-      };
+      resolve_streaming_credentials(&cache, auth_mode)?;
 
     // Create session configuration using spotify-player's client_id
     let session_config = SessionConfig {
@@ -393,11 +434,12 @@ impl StreamingPlayer {
       match timeout(Duration::from_secs(init_timeout_secs), spirc_new).await {
         Ok(Ok(result)) => break result,
         Ok(Err(e))
-          if should_retry_with_fresh_credentials(
-            true,
-            used_cached_credentials,
-            retried_with_fresh_credentials,
-          ) =>
+          if matches!(auth_mode, StreamingAuthMode::InteractiveIfNeeded)
+            && should_retry_with_fresh_credentials(
+              true,
+              used_cached_credentials,
+              retried_with_fresh_credentials,
+            ) =>
         {
           warn!(
             "Cached streaming credentials failed ({:?}); retrying with a fresh OAuth login",
@@ -425,8 +467,15 @@ impl StreamingPlayer {
       }
     };
 
-    // Spawn the Spirc task to run in the background
-    tokio::spawn(spirc_task);
+    // Track the Spirc runtime lifecycle so liveness checks can detect dead
+    // Connect sessions even if the player thread is still running.
+    let spirc_alive = Arc::new(AtomicBool::new(true));
+    let spirc_alive_for_task = Arc::clone(&spirc_alive);
+    let spirc_handle = tokio::spawn(spirc_task);
+    tokio::spawn(async move {
+      let _ = spirc_handle.await;
+      spirc_alive_for_task.store(false, Ordering::Relaxed);
+    });
 
     info!("Streaming connection established!");
 
@@ -437,6 +486,7 @@ impl StreamingPlayer {
       mixer,
       config,
       state: Arc::new(Mutex::new(PlayerState::default())),
+      spirc_alive,
     })
   }
 
@@ -447,7 +497,9 @@ impl StreamingPlayer {
 
   /// Check if the session is connected
   pub fn is_connected(&self) -> bool {
-    !self.player.is_invalid()
+    self.spirc_alive.load(Ordering::Relaxed)
+      && !self.session.is_invalid()
+      && !self.player.is_invalid()
   }
 
   /// Play a track by its Spotify URI (e.g., "spotify:track:xxxx")
@@ -586,7 +638,7 @@ impl StreamingPlayer {
 
   /// Check if the player is invalid (e.g., session disconnected)
   pub fn is_invalid(&self) -> bool {
-    self.player.is_invalid()
+    !self.is_connected()
   }
 
   /// Activate the device (make it the active playback device)
@@ -607,6 +659,7 @@ impl StreamingPlayer {
 
   /// Shutdown the player
   pub fn shutdown(&self) {
+    self.spirc_alive.store(false, Ordering::Relaxed);
     let _ = self.spirc.shutdown();
   }
 

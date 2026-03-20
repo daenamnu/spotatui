@@ -28,9 +28,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-#[cfg(feature = "streaming")]
-use crate::infra::player::StreamingPlayer;
-
 // Re-export traits
 use self::library::LibraryNetwork;
 use self::metadata::MetadataNetwork;
@@ -151,8 +148,6 @@ pub struct Network {
   pub small_search_limit: u32,
   pub client_config: ClientConfig,
   pub app: Arc<Mutex<App>>,
-  #[cfg(feature = "streaming")]
-  pub streaming_player: Option<Arc<StreamingPlayer>>,
   pub party_connection: Option<sync::PartyConnection>,
   pub party_incoming_rx: Option<tokio::sync::mpsc::UnboundedReceiver<sync::SyncMessage>>,
 }
@@ -163,7 +158,6 @@ impl Network {
     spotify: AuthCodePkceSpotify,
     client_config: ClientConfig,
     app: &Arc<Mutex<App>>,
-    streaming_player: Option<Arc<StreamingPlayer>>,
   ) -> Self {
     Network {
       spotify,
@@ -171,7 +165,6 @@ impl Network {
       small_search_limit: 4,
       client_config,
       app: Arc::clone(app),
-      streaming_player,
       party_connection: None,
       party_incoming_rx: None,
     }
