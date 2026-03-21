@@ -737,12 +737,15 @@ fn setup_logging() -> anyhow::Result<()> {
 fn install_panic_hook() {
   let default_hook = panic::take_hook();
   panic::set_hook(Box::new(move |info| {
-    let is_portaudio_panic = info
+    let is_audio_backend_panic = info
       .location()
-      .map(|location| location.file().contains("audio_backend/portaudio.rs"))
+      .map(|location| {
+        let file = location.file();
+        file.contains("audio_backend/portaudio.rs") || file.contains("audio_backend/rodio.rs")
+      })
       .unwrap_or(false);
 
-    if is_portaudio_panic {
+    if is_audio_backend_panic {
       eprintln!(
         "Recoverable audio backend panic detected. Playback may pause while the output device changes."
       );
@@ -2084,9 +2087,7 @@ async fn disconnect_streaming_player(
   status_message: &str,
 ) -> Option<StreamingRecoveryRequest> {
   let mut app_lock = app.lock().await;
-  let Some(current_player) = app_lock.streaming_player.as_ref() else {
-    return None;
-  };
+  let current_player = app_lock.streaming_player.as_ref()?;
   if !Arc::ptr_eq(current_player, player) {
     return None;
   }
