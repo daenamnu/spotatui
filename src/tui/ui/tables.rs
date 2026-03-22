@@ -691,8 +691,7 @@ fn draw_table(
     .map(|height| height as usize)
     .unwrap_or(0);
 
-  let use_page_scroll = header.id == TableId::Song;
-  let offset = table_scroll_offset(selected_index, visible_rows, use_page_scroll);
+  let offset = table_scroll_offset(selected_index, visible_rows);
 
   let rows = items.iter().skip(offset).enumerate().map(|(i, item)| {
     let mut formatted_row = item.format.clone();
@@ -773,14 +772,10 @@ fn draw_table(
   f.render_widget(table, layout_chunk);
 }
 
-fn table_scroll_offset(selected_index: usize, visible_rows: usize, paged: bool) -> usize {
+fn table_scroll_offset(selected_index: usize, visible_rows: usize) -> usize {
   if visible_rows == 0 {
     return 0;
   }
 
-  if paged {
-    (selected_index / visible_rows) * visible_rows
-  } else {
-    selected_index.saturating_sub(visible_rows.saturating_sub(1))
-  }
+  selected_index.saturating_sub(visible_rows.saturating_sub(1))
 }
