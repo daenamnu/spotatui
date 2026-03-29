@@ -2553,6 +2553,10 @@ async fn start_ui(
         ActiveBlock::Settings => {
           ui::settings::draw_settings(f, &app);
         }
+        ActiveBlock::CreatePlaylistForm => {
+          ui::draw_main_layout(f, &app);
+          ui::draw_create_playlist_form(f, &app);
+        }
         _ => {
           ui::draw_main_layout(f, &app);
         }
@@ -2863,6 +2867,10 @@ async fn start_ui(
           ActiveBlock::AnnouncementPrompt => ui::draw_announcement_prompt(f, &app),
           ActiveBlock::ExitPrompt => ui::draw_exit_prompt(f, &app),
           ActiveBlock::Settings => ui::settings::draw_settings(f, &app),
+          ActiveBlock::CreatePlaylistForm => {
+            ui::draw_main_layout(f, &app);
+            ui::draw_create_playlist_form(f, &app);
+          }
           _ => ui::draw_main_layout(f, &app),
         }
       })?;
