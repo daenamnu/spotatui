@@ -77,24 +77,37 @@ pub fn draw_artist_table(f: &mut Frame<'_>, app: &App, layout_chunk: Rect) {
     current_route.active_block == ActiveBlock::Artists,
     current_route.hovered_block == ActiveBlock::Artists,
   );
-  let items = app
-    .artists
-    .iter()
-    .map(|item| TableItem {
-      id: item.id.id().to_string(),
-      format: vec![item.name.to_owned()],
-    })
-    .collect::<Vec<TableItem>>();
 
-  draw_table(
-    f,
-    app,
-    layout_chunk,
-    ("Artists", &header),
-    &items,
-    app.artists_list_index,
-    highlight_state,
-  )
+  if let Some(saved_artists) = app.library.saved_artists.get_results(None) {
+    let items = saved_artists
+      .items
+      .iter()
+      .map(|item| TableItem {
+        id: item.id.id().to_string(),
+        format: vec![item.name.to_owned()],
+      })
+      .collect::<Vec<TableItem>>();
+
+    draw_table(
+      f,
+      app,
+      layout_chunk,
+      ("Artists", &header),
+      &items,
+      app.artists_list_index,
+      highlight_state,
+    )
+  } else {
+    draw_table(
+      f,
+      app,
+      layout_chunk,
+      ("Artists", &header),
+      &[],
+      app.artists_list_index,
+      highlight_state,
+    )
+  }
 }
 
 pub fn draw_podcast_table(f: &mut Frame<'_>, app: &App, layout_chunk: Rect) {

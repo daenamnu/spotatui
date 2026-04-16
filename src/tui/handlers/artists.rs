@@ -40,36 +40,36 @@ pub fn handler(key: Key, app: &mut App) {
       }
     }
     Key::Enter => {
-      let artists = app.artists.to_owned();
-      if !artists.is_empty() {
-        let artist = &artists[app.artists_list_index];
-        app.get_artist(artist.id.as_ref().into_static(), artist.name.clone());
+      if let Some(artists) = app.library.saved_artists.get_results(None) {
+        if let Some(artist) = artists.items.get(app.artists_list_index) {
+          app.get_artist(artist.id.as_ref().into_static(), artist.name.clone());
+        }
       }
     }
     Key::Char('D') => app.user_unfollow_artists(ActiveBlock::AlbumList),
     Key::Char('e') => {
-      let artists = app.artists.to_owned();
-      let artist = artists.get(app.artists_list_index);
-      if let Some(artist) = artist {
-        app.dispatch(IoEvent::StartPlayback(
-          Some(rspotify::model::PlayContextId::Artist(
-            artist.id.clone().into_static(),
-          )),
-          None,
-          None,
-        ));
+      if let Some(artists) = app.library.saved_artists.get_results(None) {
+        if let Some(artist) = artists.items.get(app.artists_list_index) {
+          app.dispatch(IoEvent::StartPlayback(
+            Some(rspotify::model::PlayContextId::Artist(
+              artist.id.clone().into_static(),
+            )),
+            None,
+            None,
+          ));
+        }
       }
     }
     Key::Char('r') => {
-      let artists = app.artists.to_owned();
-      let artist = artists.get(app.artists_list_index);
-      if let Some(artist) = artist {
-        let artist_name = artist.name.clone();
-        let artist_id_list: Option<Vec<String>> = Some(vec![artist.id.id().to_string()]);
+      if let Some(artists) = app.library.saved_artists.get_results(None) {
+        if let Some(artist) = artists.items.get(app.artists_list_index) {
+          let artist_name = artist.name.clone();
+          let artist_id_list: Option<Vec<String>> = Some(vec![artist.id.id().to_string()]);
 
-        app.recommendations_context = Some(RecommendationsContext::Artist);
-        app.recommendations_seed = artist_name;
-        app.get_recommendations_for_seed(artist_id_list, None, None);
+          app.recommendations_context = Some(RecommendationsContext::Artist);
+          app.recommendations_seed = artist_name;
+          app.get_recommendations_for_seed(artist_id_list, None, None);
+        }
       }
     }
     k if k == app.user_config.keys.next_page => app.get_current_user_saved_artists_next(),
