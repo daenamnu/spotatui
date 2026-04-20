@@ -55,7 +55,7 @@ pub fn draw_input_and_help_box(f: &mut Frame<'_>, app: &App, layout_chunk: Rect)
     current_route.hovered_block == ActiveBlock::Input,
   );
 
-  let show_loading = app.is_loading && app.user_config.behavior.show_loading_indicator;
+  let show_loading = false;
   let border_type = if show_loading {
     BorderType::Double
   } else {
