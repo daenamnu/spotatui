@@ -113,16 +113,12 @@ fn ensure_connected(
 fn build_activity(playback: &DiscordPlayback) -> activity::Activity<'_> {
   let mut activity = activity::Activity::new()
     .details(&playback.title)
-    .details_url(REPO_URL)
     .state(&playback.state)
-    .state_url(REPO_URL)
     .activity_type(activity::ActivityType::Listening);
 
   if let Some(image_url) = playback.image_url.as_deref() {
     let assets = activity::Assets::new()
-      .large_image(image_url)
-      .large_text(REPO_URL)
-      .small_text(REPO_TAGLINE);
+      .large_image(image_url);
     activity = activity.assets(assets);
   }
 
